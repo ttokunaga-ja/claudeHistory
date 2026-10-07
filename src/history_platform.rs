@@ -36,11 +36,15 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    injected_sync_failure(path)?;
     fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 #[cfg(windows)]
 pub fn sync_dir(_path: &Path) -> Result<()> {
+    #[cfg(test)]
+    injected_sync_failure(_path)?;
     // The manifest explicitly records this platform limitation. MoveFileExW
     // WRITE_THROUGH is used for both new registrations and journal replacement.
     Ok(())
@@ -163,4 +167,40 @@ pub fn private_dir(path: &Path) -> Result<()> {
         CloseHandle(token);
         result
     }
+}
+
+#[cfg(unix)]
+pub fn private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+#[cfg(windows)]
+pub fn private_file(path: &Path) -> Result<()> {
+    private_dir(path)
+}
+
+// Per-thread fault injection exercises the critical publish -> directory fsync
+// failure window without affecting other tests or production builds.
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_SYNC: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn fail_next_sync(path: &Path) {
+    FAIL_SYNC.with(|slot| *slot.borrow_mut() = Some(path.to_owned()));
+}
+#[cfg(test)]
+fn injected_sync_failure(path: &Path) -> Result<()> {
+    let fail = FAIL_SYNC.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_deref() == Some(path) {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    });
+    ensure!(!fail, "injected directory sync failure");
+    Ok(())
 }

@@ -27,7 +27,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'scripts\install.ps1') -Destination $installer
     Write-Manifest
     & $installer -BinDir $bin
-    if (@(& $installed --version)[0] -cne 'claudeHistory 0.2.0' -or $LASTEXITCODE -ne 0) { throw 'Valid installation failed.' }
+    if (@(& $installed --version)[0] -cne 'claudeHistory 0.3.0' -or $LASTEXITCODE -ne 0) { throw 'Valid installation failed.' }
     $script:goodHash = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
     # Exercise atomic replacement of an existing executable as well.
     & $installer -BinDir $bin
@@ -42,7 +42,7 @@ try {
     $text = [Text.Encoding]::ASCII.GetString($bytes)
     $count = 0
     $offset = 0
-    while (($offset = $text.IndexOf('0.2.0', $offset, [StringComparison]::Ordinal)) -ge 0) {
+    while (($offset = $text.IndexOf('0.3.0', $offset, [StringComparison]::Ordinal)) -ge 0) {
         $bytes[$offset + 4] = [byte][char]'1'
         $count++
         $offset += 5
@@ -50,7 +50,7 @@ try {
     if ($count -eq 0) { throw 'Could not create the wrong-version fixture.' }
     [IO.File]::WriteAllBytes($source, $bytes)
     $wrongVersion = @(& $source --version)
-    if ($LASTEXITCODE -ne 0 -or $wrongVersion.Count -ne 1 -or $wrongVersion[0] -cne 'claudeHistory 0.2.1') {
+    if ($LASTEXITCODE -ne 0 -or $wrongVersion.Count -ne 1 -or $wrongVersion[0] -cne 'claudeHistory 0.3.1') {
         throw 'Wrong-version fixture did not run as expected.'
     }
     Write-Manifest

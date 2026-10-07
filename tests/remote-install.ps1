@@ -67,7 +67,7 @@ try {
     $env:CLAUDE_HISTORY_INSTALL_NO_PATH = '1'
     Invoke-Expression $remoteSource
     $version = @(& $installed --version)
-    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.2.0') { throw 'Valid remote installation failed.' }
+    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.3.0') { throw 'Valid remote installation failed.' }
     $goodHash = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
     Assert-UnchangedPath
     Invoke-Expression $remoteSource

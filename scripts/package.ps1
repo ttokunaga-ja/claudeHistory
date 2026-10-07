@@ -14,7 +14,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
     $binary = Join-Path $root 'target\release\claudeHistory.exe'
     $version = @(& $binary --version)
-    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.2.0') { throw 'Unexpected binary version.' }
+    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.3.0') { throw 'Unexpected binary version.' }
     $destination = Join-Path $root 'target\package\claudeHistory-windows-x64'
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
     [void][IO.Directory]::CreateDirectory($destination)
