@@ -6,28 +6,30 @@ macOS（Apple Silicon）とWindows（x64）に対応しています。通常チ�
 
 ## インストール
 
-### macOS
+OSに合うコマンドを1回実行します。最新の正式リリースを自動ダウンロードし、SHA-256と実行ファイルの版を確認してからインストールします。実行するフォルダーを選ぶ必要はありません。Rust・Python・管理者権限は不要です。
 
-[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-macos-arm64.tar.gz`をダウンロードして展開し、同梱の`install.sh`を実行してください。配布版はApple Silicon向けです。
+### macOS（Apple Silicon / ターミナル）
 
 ```sh
-tar -xzf claudeHistory-macos-arm64.tar.gz
-sh claudeHistory-macos-arm64/install.sh
+curl -fsSL https://raw.githubusercontent.com/ttokunaga-ja/claudeHistory/main/install.sh | sh
 ```
 
-`~/.local/bin/claudeHistory`へインストールします。SHA-256と版の検証に失敗した場合は既存の実行ファイルを置き換えません。`~/.local/bin`をPATHに追加してから利用してください。
+`~/.local/bin/claudeHistory`へインストールし、使用しているシェルの設定ファイル（zshなら`~/.zshrc`）へPATHの設定を追加します。**新しいターミナルを開く**と`claudeHistory`を使えます。Intel Mac向けの配布はありません。
 
-### Windows
-
-[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-windows-x64.zip`をダウンロードします。PowerShellでダウンロード先を開いて実行してください。
+### Windows x64（PowerShell）
 
 ```powershell
-Expand-Archive .\claudeHistory-windows-x64.zip -DestinationPath .\claudeHistory-package
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\claudeHistory-package\claudeHistory-windows-x64\install.ps1
-& "$env:USERPROFILE\.local\bin\claudeHistory.exe" --version
+irm https://raw.githubusercontent.com/ttokunaga-ja/claudeHistory/main/install.ps1 | iex
 ```
 
-`%USERPROFILE%\.local\bin`にインストールします。上の`-ExecutionPolicy Bypass`はこのインストール用プロセスだけに適用され、Windows全体の設定は変更しません。SHA-256と版を検証してから既存の実行ファイルを置き換えます。Windowsの「環境変数」で、このフォルダーをユーザーのPATHに追加してターミナルを開き直すと、以下のコマンドをそのまま使えます。
+`%USERPROFILE%\.local\bin\claudeHistory.exe`へインストールし、ユーザーPATHと現在のPowerShellのPATHへ追加します。そのまま`claudeHistory`を使えます。
+
+```sh
+claudeHistory --version
+claudeHistory --help
+```
+
+チェックサムや実行ファイルの検証に失敗した場合は、既存の実行ファイルを置き換えません。更新時も同じインストールコマンドを使います。配布パッケージを手動で取得する場合は[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)からダウンロードし、展開したフォルダー内の`install.sh`または`install.ps1`を実行してください。展開コマンドはダウンロード先のフォルダーで実行する必要があります。
 
 ## 使い方
 
@@ -85,6 +87,7 @@ cargo test --locked
 cargo build --release --locked
 sh scripts/package.sh
 sh tests/install.sh
+sh tests/remote-install.sh
 ```
 
 パッケージ内の`install.sh`を実行すると、SHA-256と実行ファイルの版を検証してから`~/.local/bin/claudeHistory`にインストールします。macOSで実行した場合は現在のMac向けのバイナリです。Apple SiliconとIntelの両方に配布するには、それぞれビルドと実機検証が必要です。
@@ -101,6 +104,7 @@ cargo +stable-x86_64-pc-windows-msvc clippy --all-targets --locked -- -D warning
 cargo +stable-x86_64-pc-windows-msvc test --locked
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\remote-install.ps1
 ```
 
 共通処理は`history.rs`と`runtime.rs`、OS依存のファイル操作は`history_platform.rs`、実行状態の取得と終了要求は`runtime/macos.rs`・`runtime/windows.rs`、標準保存先は`platform.rs`に分離しています。
