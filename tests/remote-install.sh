@@ -23,7 +23,7 @@ export BIN_DIR="$task_test/home/bin with ' quote \$literal"
 export HOME="$task_test/home" SHELL=/bin/zsh
 PATH="$task_test/tools:$PATH"; export PATH
 sh "$task_root/install.sh"
-test "$("$BIN_DIR/claudeHistory" --version)" = 'claudeHistory 0.5.0'
+test "$("$BIN_DIR/claudeHistory" --version)" = 'claudeHistory 0.5.1'
 task_good=$(shasum -a 256 "$BIN_DIR/claudeHistory" | awk '{print $1}')
 printf '%064d  claudeHistory-macos-arm64.tar.gz\n' 0 > "$task_test/fixture/SHA256SUMS"
 if sh "$task_root/install.sh"; then exit 1; fi

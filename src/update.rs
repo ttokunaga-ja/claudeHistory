@@ -1,6 +1,5 @@
 //! Explicit, checksum-verified updates from the official GitHub releases.
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -39,13 +38,14 @@ fn update(
     verify_version: impl FnOnce(&Path, &str) -> Result<()>,
 ) -> Result<bool> {
     let original = Fingerprint::read(exe)?;
-    let release: Value = serde_json::from_slice(&fetch(&format!(
-        "https://api.github.com/repos/{REPO}/releases/latest"
+    let release_url = String::from_utf8(fetch(&format!(
+        "https://github.com/{REPO}/releases/latest"
     ))?)
-    .context("リリース情報を読めません")?;
-    let tag = release["tag_name"]
-        .as_str()
-        .context("リリースタグがありません")?;
+    .context("リリースの転送先を読めません")?;
+    let prefix = format!("https://github.com/{REPO}/releases/tag/");
+    let tag = release_url
+        .strip_prefix(&prefix)
+        .context("公式リポジトリのリリース転送先ではありません")?;
     let latest = tag
         .strip_prefix('v')
         .context("リリースタグは vX.Y.Z が必要です")?;
@@ -157,29 +157,39 @@ impl Drop for UpdateLock {
 }
 
 fn get(url: &str) -> Result<Vec<u8>> {
-    let out = Command::new("curl")
-        .args([
-            "--disable",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "120",
-            "--max-filesize",
-            "134217728",
-            "--user-agent",
-            "claudeHistory-updater",
-            url,
-        ])
-        .output()
-        .context("curl を実行できません")?;
+    let mut command = Command::new("curl");
+    command.args([
+        "--disable",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "120",
+        "--max-filesize",
+        "134217728",
+        "--user-agent",
+        "claudeHistory-updater",
+    ]);
+    // Discover the latest stable release through GitHub's public redirect.
+    // Write HEAD headers to a closed temporary path so stdout contains only
+    // the final URL; this also works with Windows temporary-file semantics.
+    let head_output = if url == format!("https://github.com/{REPO}/releases/latest") {
+        let output = tempfile::NamedTempFile::new()?.into_temp_path();
+        command.args(["--head", "--write-out", "%{url_effective}", "--output"]);
+        command.arg(&output);
+        Some(output)
+    } else {
+        None
+    };
+    let out = command.arg(url).output().context("curl を実行できません")?;
+    drop(head_output);
     if !out.status.success() {
         bail!(
             "ダウンロードに失敗しました ({url}): {}",
@@ -325,7 +335,8 @@ mod tests {
             "0.1.0",
             |url| {
                 if url.ends_with("/latest") {
-                    return Ok(format!(r#"{{"tag_name":"{tag}"}}"#).into_bytes());
+                    assert_eq!(url, format!("https://github.com/{REPO}/releases/latest"));
+                    return Ok(format!("https://github.com/{REPO}/releases/tag/{tag}").into_bytes());
                 }
                 if url.ends_with("/SHA256SUMS") {
                     return Ok(format!("{hash}  {ASSET}\n").into_bytes());
@@ -365,6 +376,46 @@ mod tests {
     }
 
     #[test]
+    fn discovery_failure_and_untrusted_redirect_preserve_installed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("claudeHistory-test");
+        fs::write(&exe, b"original").unwrap();
+        for url in [
+            "https://example.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0",
+            "https://github.com/other/claudeHistory/releases/tag/v0.2.0",
+            "http://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0?download=1",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0/../v0.3.0",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v01.2.0",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0-beta",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0#tag",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/latest",
+            "https://github.com/ttokunaga-ja/claudeHistory/releases/tag/v0.2.0\n",
+        ] {
+            let mut requests = 0;
+            let result = update(
+                &exe,
+                "0.1.0",
+                |requested| {
+                    requests += 1;
+                    assert_eq!(
+                        requested,
+                        format!("https://github.com/{REPO}/releases/latest")
+                    );
+                    Ok(url.as_bytes().to_vec())
+                },
+                |_, _| panic!("invalid discovery must not stage an update"),
+            );
+            assert!(result.is_err(), "{url}");
+            assert_eq!(requests, 1);
+            assert_eq!(fs::read(&exe).unwrap(), b"original");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+        assert!(update(&exe, "0.1.0", |_| bail!("discovery failed"), |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"original");
+    }
+
+    #[test]
     fn concurrent_replacement_is_not_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("claudeHistory");
@@ -376,7 +427,7 @@ mod tests {
             "0.1.0",
             |url| {
                 Ok(if url.ends_with("/latest") {
-                    br#"{"tag_name":"v0.2.0"}"#.to_vec()
+                    format!("https://github.com/{REPO}/releases/tag/v0.2.0").into_bytes()
                 } else if url.ends_with("/SHA256SUMS") {
                     sums.as_bytes().to_vec()
                 } else {
