@@ -1,4 +1,4 @@
-//! Standalone executable-only uninstall; no application-specific dependencies.
+//! Uninstall the CLI and its default data directory, preserving Claude data.
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,23 +17,31 @@ fn fingerprint(path: &Path) -> Result<Vec<u8>> {
     Ok(Sha256::digest(fs::read(path)?).to_vec())
 }
 
+mod data;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
-/// Prompt for the canonical running executable and remove only that executable.
+/// Remove this CLI and its default owned data after confirmation.
 pub fn run() -> Result<()> {
     let executable =
         fs::canonicalize(env::current_exe()?).context("実行中の実行ファイルを特定できません")?;
-    let original = fingerprint(&executable)?;
+    let home = fs::canonicalize(dirs::home_dir().context("ホームフォルダを特定できません")?)?;
+    run_at(&executable, &home.join(".claude-history"))
+}
+
+fn run_at(executable: &Path, app_root: &Path) -> Result<()> {
+    let plan = data::prepare(app_root, executable)?;
+    let original = fingerprint(executable)?;
     #[cfg(unix)]
-    let original_identity = unix::identity(&executable)?;
+    let original_identity = unix::identity(executable)?;
     eprintln!("claudeHistory の削除対象: {}", executable.display());
     eprintln!(
-        "削除するのはこのCLIの実行ファイルだけです。Claudeの履歴・登録設定・バックアップ・PATH設定は保持します。"
+        "claudeHistoryの登録設定とバックアップも削除します。削除後はバックアップによる同期の取り消しができません。Claude本体の履歴とPATH設定は保持します。"
     );
-    eprint!("この実行ファイルを削除しますか？ [y/N]: ");
+    eprintln!("データフォルダの削除対象: {}", app_root.display());
+    eprint!("実行ファイルとclaudeHistoryのデータを削除しますか？ [y/N]: ");
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -41,22 +49,27 @@ pub fn run() -> Result<()> {
         eprintln!("キャンセルしました。変更していません。");
         return Ok(());
     }
-    if fingerprint(&executable)? != original {
+    if fingerprint(executable)? != original {
         bail!("確認中に実行ファイルが変更されました。削除を中止しました");
     }
     #[cfg(unix)]
-    if unix::identity(&executable)? != original_identity {
+    if unix::identity(executable)? != original_identity {
         bail!("確認中に実行ファイルが置き換えられました。削除を中止しました");
     }
+    data::remove(plan)?;
+    eprintln!(
+        "claudeHistoryのデータを削除しました: {}",
+        app_root.display()
+    );
     #[cfg(windows)]
     {
-        windows::schedule(&executable, &original)
+        windows::schedule(executable, &original)
     }
     #[cfg(not(any(unix, windows)))]
     bail!("このOSではアンインストールに対応していません");
     #[cfg(unix)]
     {
-        unix::remove(&executable)?;
+        unix::remove(executable)?;
         eprintln!("実行ファイルを削除しました: {}", executable.display());
         Ok(())
     }

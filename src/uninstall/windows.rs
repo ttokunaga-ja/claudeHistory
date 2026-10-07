@@ -14,6 +14,14 @@ pub(super) fn reject_reparse_point(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn metadata_identity(metadata: &fs::Metadata) -> Vec<u64> {
+    use std::os::windows::fs::MetadataExt;
+    vec![
+        metadata.creation_time(),
+        u64::from(metadata.file_attributes()),
+    ]
+}
+
 // All variable data travels through child-only environment variables, never source.
 const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -212,6 +220,96 @@ fn rollback_with_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_cleanup_child() {
+        let Some(executable) = env::var_os("CLAUDE_HISTORY_TEST_UNINSTALL_EXE") else {
+            return;
+        };
+        let root = env::var_os("CLAUDE_HISTORY_TEST_UNINSTALL_ROOT").unwrap();
+        super::super::run_at(Path::new(&executable), Path::new(&root)).unwrap();
+    }
+
+    #[test]
+    fn isolated_windows_cleanup_preserves_claude_and_confirms_deferred_deletion() {
+        use std::io::Write;
+        for answer in ["y\n", "YES\n", "はい\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(directory.path()).unwrap();
+            let executable = base.join("claudeHistory-test.exe");
+            fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+            let root = base.join(".claude-history");
+            fs::create_dir_all(root.join("backups/test")).unwrap();
+            fs::write(root.join("accounts.json"), b"settings").unwrap();
+            fs::write(root.join("backups/test/manifest.json"), b"backup").unwrap();
+            let sentinels = [
+                ".claude/history.json",
+                "AppData/Roaming/Claude/config.json",
+                "AppData/Roaming/Claude/claude-code-sessions/session/local.json",
+                "custom-profiles.json",
+                ".profile",
+            ];
+            for name in sentinels {
+                let path = base.join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, name).unwrap();
+            }
+            let mut child = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "uninstall::windows::tests::isolated_cleanup_child",
+                    "--nocapture",
+                ])
+                .env("CLAUDE_HISTORY_TEST_UNINSTALL_EXE", &executable)
+                .env("CLAUDE_HISTORY_TEST_UNINSTALL_ROOT", &root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(answer.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!executable.exists());
+            assert!(!root.exists());
+            for name in sentinels {
+                assert_eq!(fs::read_to_string(base.join(name)).unwrap(), name);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let receipt_line = stderr
+                .lines()
+                .find(|line| line.starts_with("結果の記録: "))
+                .unwrap();
+            let receipt = receipt_line
+                .trim_start_matches("結果の記録: ")
+                .split("（status:")
+                .next()
+                .unwrap()
+                .trim();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            loop {
+                let record: serde_json::Value =
+                    serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+                if record["status"] == "deleted" {
+                    assert!(!Path::new(record["staged_path"].as_str().unwrap()).exists());
+                    break;
+                }
+                assert_ne!(record["status"], "failed", "{record}");
+                assert!(Instant::now() < deadline, "{record}");
+                thread::sleep(Duration::from_millis(100));
+            }
+            fs::remove_dir_all(Path::new(receipt).parent().unwrap()).unwrap();
+        }
+    }
 
     #[test]
     fn failed_restore_preserves_existing_helper_receipt() {

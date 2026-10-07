@@ -37,7 +37,7 @@ struct Cli {
 enum Command {
     /// 最新の公開リリースへCLI本体を更新
     Update,
-    /// 確認後にCLI本体だけを削除（履歴・設定・バックアップは保持）
+    /// 確認後にCLI本体・専用設定・バックアップを削除（Claudeの履歴は保持）
     Uninstall,
     /// 全登録アカウントへ不足履歴を同期
     Sync {

@@ -9,3 +9,8 @@ pub(super) fn identity(path: &Path) -> Result<(u64, u64)> {
 pub(super) fn remove(executable: &Path) -> Result<()> {
     fs::remove_file(executable).context("実行ファイルを削除できません")
 }
+
+pub(super) fn metadata_identity(metadata: &fs::Metadata) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+    vec![metadata.dev(), metadata.ino()]
+}

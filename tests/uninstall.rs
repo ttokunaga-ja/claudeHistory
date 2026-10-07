@@ -17,6 +17,9 @@ fn copied_executable(root: &std::path::Path) -> std::path::PathBuf {
 fn preserved_data(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     [
         ".claude/history.json",
+        "Library/Application Support/Claude/config.json",
+        "Library/Application Support/Claude/claude-code-sessions/session/local.json",
+        "custom-profiles.json",
         ".claude-history/accounts.json",
         ".claude-history/backups/test/manifest.json",
         ".profile",
@@ -71,8 +74,9 @@ fn uninstall_cancellation_preserves_executable_and_neighbor_data() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn uninstall_confirmation_removes_only_copied_executable() {
+fn uninstall_confirmation_removes_tool_data_and_preserves_claude() {
     for answer in ["y\n", "YES\n", "はい\n"] {
         let directory = tempfile::tempdir().unwrap();
         let executable = copied_executable(directory.path());
@@ -80,7 +84,6 @@ fn uninstall_confirmation_removes_only_copied_executable() {
         let mut child = Command::new(&executable)
             .arg("uninstall")
             .env("HOME", directory.path())
-            .env("USERPROFILE", directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -99,35 +102,11 @@ fn uninstall_confirmation_removes_only_copied_executable() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!executable.exists());
-        assert_preserved(&data);
-        #[cfg(windows)]
-        {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let receipt_line = stderr
-                .lines()
-                .find(|line| line.starts_with("結果の記録: "))
-                .unwrap();
-            let receipt = receipt_line
-                .trim_start_matches("結果の記録: ")
-                .split("（status:")
-                .next()
-                .unwrap()
-                .trim();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-            loop {
-                let record: serde_json::Value =
-                    serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
-                if record["status"] == "deleted" {
-                    assert!(
-                        !std::path::Path::new(record["staged_path"].as_str().unwrap()).exists()
-                    );
-                    break;
-                }
-                assert_ne!(record["status"], "failed", "{record}");
-                assert!(std::time::Instant::now() < deadline, "{record}");
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!directory.path().join(".claude-history").exists());
+        for (path, bytes) in data {
+            if !path.starts_with(directory.path().join(".claude-history")) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
             }
-            fs::remove_dir_all(std::path::Path::new(receipt).parent().unwrap()).unwrap();
         }
     }
 }
@@ -140,6 +119,7 @@ fn executable_replacement_during_confirmation_is_preserved() {
     let executable = copied_executable(directory.path());
     let mut child = Command::new(&executable)
         .arg("uninstall")
+        .env("HOME", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -164,4 +144,48 @@ fn executable_replacement_during_confirmation_is_preserved() {
     assert!(!status.success());
     assert!(error.contains("置き換え"), "{error}");
     assert!(executable.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_data_aborts_uninstall_and_keeps_executable_and_claude() {
+    for root_link in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = copied_executable(directory.path());
+        let data = preserved_data(directory.path());
+        let root = directory.path().join(".claude-history");
+        let outside = directory.path().join(".claude");
+        let link = if root_link {
+            fs::rename(&root, directory.path().join("saved-tool-data")).unwrap();
+            root.clone()
+        } else {
+            root.join("linked-claude-data")
+        };
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let mut child = Command::new(&executable)
+            .arg("uninstall")
+            .env("HOME", directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(b"yes\n");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("リンク"));
+        assert!(executable.exists());
+        for (path, bytes) in data {
+            let checked_path = if root_link && path.starts_with(&root) {
+                directory
+                    .path()
+                    .join("saved-tool-data")
+                    .join(path.strip_prefix(&root).unwrap())
+            } else {
+                path
+            };
+            assert_eq!(fs::read(checked_path).unwrap(), bytes);
+        }
+        fs::remove_file(link).unwrap();
+    }
 }
