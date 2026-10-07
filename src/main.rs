@@ -4,11 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use claude_history::{
     history::{Account, Store},
-    profiles::{Profile, Profiles, validate_email, validate_label},
     runtime::{self, Activity},
 };
 use std::{
-    collections::BTreeMap,
     io::{self, IsTerminal, Write},
     path::PathBuf,
 };
@@ -26,9 +24,6 @@ struct Cli {
     /// Claude CLIの設定フォルダー（既定: CLAUDE_CONFIG_DIR または ~/.claude）
     #[arg(long, global = true)]
     cli_dir: Option<PathBuf>,
-    /// メールアドレス・組織の表示設定（既定: ~/.claude-history/accounts.json）
-    #[arg(long, global = true)]
-    profiles_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -39,13 +34,11 @@ enum Command {
     Update,
     /// 確認後にCLI本体・専用設定・バックアップを削除（Claudeの履歴は保持）
     Uninstall,
-    /// 全登録アカウントへ不足履歴を同期
+    /// 保存済みの全アカウント・組織へ不足履歴を同期
     Sync {
         #[arg(long)]
         dry_run: bool,
     },
-    /// メールアドレス・組織名・同期対象組織を設定
-    Configure,
     /// 保存済みアカウント・組織と履歴件数を表示
     Accounts,
     /// 起動・作業状態を確認（変更なし）
@@ -96,63 +89,29 @@ fn run() -> Result<()> {
         root: data_root.clone(),
         backup_root: home.join(".claude-history/backups"),
     };
-    let profiles_path = cli
-        .profiles_file
-        .unwrap_or_else(|| home.join(".claude-history/accounts.json"));
-    let interactive = cli.command.is_none();
     let command = match cli.command {
         Some(command) => command,
         None => menu(&mut io::stdin().lock(), &mut io::stdout().lock())?,
-    };
-    let mut profiles = if matches!(&command, Command::Status | Command::Undo { .. }) {
-        Profiles::default()
-    } else {
-        Profiles::load(&profiles_path)?
     };
     match command {
         Command::Update | Command::Uninstall => {
             unreachable!("maintenance commands handled before history access")
         }
-        Command::Configure => {
-            let all = store.accounts()?;
-            let current = store.current_account()?;
-            configure(
-                &all,
-                &mut profiles,
-                Some(&current),
-                &mut io::stdin().lock(),
-                &mut io::stdout().lock(),
-            )?;
-            profiles.save(&profiles_path)?;
-            println!("アカウント設定を保存しました。");
-        }
         Command::Sync { dry_run } => {
             let current = store.current_account()?;
             let all = store.accounts()?;
-            if interactive && !dry_run && profiles.selected(&all).is_err() {
-                println!("同期対象のメールアドレス・組織を設定してください。");
-                configure(
-                    &all,
-                    &mut profiles,
-                    Some(&current),
-                    &mut io::stdin().lock(),
-                    &mut io::stdout().lock(),
-                )?;
-                profiles.save(&profiles_path)?;
-            }
-            let selected = profiles.selected(&all)?;
-            let plan = store.plan_sync(&selected)?;
-            println!("全アカウント同期の事前確認:");
+            let plan = store.plan_sync(&all)?;
+            println!("全アカウント・組織の同期予定:");
             for target in &plan.targets {
                 println!(
                     "  {} / 追加={}件 / 既存={}件（保持）",
-                    profiles.label(&target.account, Some(&current)),
+                    account_label(&target.account, Some(&current)),
                     target.additions,
                     target.existing
                 );
             }
             if dry_run {
-                println!("確認のみ: 設定保存・履歴変更・アプリ終了は行いません。");
+                println!("確認のみ: 履歴変更・アプリ終了は行いません。");
                 show_activity(&runtime::inspect(&data_root, &cli_root)?);
                 return Ok(());
             }
@@ -174,7 +133,7 @@ fn run() -> Result<()> {
         Command::Accounts => {
             let current = store.current_account()?;
             for account in store.accounts()? {
-                println!("{}", profiles.label(&account, Some(&current)));
+                println!("{}", account_label(&account, Some(&current)));
             }
             println!(
                 "現在候補はDesktopの保存設定から取得しています。切り替え直後はログイン画面と照合してください。"
@@ -199,19 +158,19 @@ fn run() -> Result<()> {
                 })
                 .cloned()
                 .collect();
-            let source = choose("移行元", &sources, &profiles, &current)?;
+            let source = choose("移行元", &sources, &current)?;
             let targets: Vec<_> = all
                 .iter()
                 .filter(|a| a.account == current && to_org.as_ref().is_none_or(|id| &a.org == id))
                 .cloned()
                 .collect();
             // 組織は件数から推測しない。複数あれば明示選択する。
-            let target = choose("移行先（現在のアカウント）", &targets, &profiles, &current)?;
+            let target = choose("移行先（現在のアカウント）", &targets, &current)?;
             let plan = store.plan(&source, &target)?;
             println!(
                 "移行元 {}\n移行先 {}\n追加={}件 / 既存={}件（保持）",
-                profiles.label(&source, Some(&current)),
-                profiles.label(&target, Some(&current)),
+                account_label(&source, Some(&current)),
+                account_label(&target, Some(&current)),
                 plan.additions.len(),
                 plan.existing
             );
@@ -255,9 +214,9 @@ fn run() -> Result<()> {
 fn menu(input: &mut dyn io::BufRead, output: &mut dyn Write) -> Result<Command> {
     writeln!(
         output,
-        "1: すべてのアカウントに不足履歴を同期\n2: 現在のアカウントへ引き継ぎ\n3: アカウント設定\n4: 状態確認"
+        "1: すべてのアカウントに不足履歴を同期\n2: 現在のアカウントへ引き継ぎ\n3: 状態確認"
     )?;
-    match read_choice(input, output, 4)? {
+    match read_choice(input, output, 3)? {
         1 => Ok(Command::Sync { dry_run: false }),
         2 => Ok(Command::Transfer {
             from: None,
@@ -265,8 +224,7 @@ fn menu(input: &mut dyn io::BufRead, output: &mut dyn Write) -> Result<Command> 
             to_org: None,
             dry_run: false,
         }),
-        3 => Ok(Command::Configure),
-        4 => Ok(Command::Status),
+        3 => Ok(Command::Status),
         _ => unreachable!(),
     }
 }
@@ -285,126 +243,30 @@ fn read_choice(input: &mut dyn io::BufRead, output: &mut dyn Write, count: usize
         .context("候補の番号が無効です")?;
     Ok(number)
 }
-fn read_label(
-    prompt: &str,
-    old: Option<&str>,
-    email: bool,
-    input: &mut dyn io::BufRead,
-    output: &mut dyn Write,
-) -> Result<String> {
-    loop {
-        if let Some(value) = old {
-            write!(output, "{prompt}（Enterで保持: {value}）: ")?;
+fn account_label(account: &Account, current: Option<&str>) -> String {
+    format!(
+        "account={} org={} / 履歴={}件{}",
+        account.account,
+        account.org,
+        account.sessions,
+        if current == Some(account.account.as_str()) {
+            " [Desktop保存情報の現在候補]"
         } else {
-            write!(output, "{prompt}（Enterで中止）: ")?;
+            ""
         }
-        output.flush()?;
-        let mut value = String::new();
-        if input.read_line(&mut value)? == 0 {
-            bail!("選択を中止しました");
-        }
-        let value = value.trim_end_matches(['\r', '\n']);
-        if value.is_empty() {
-            return old.map(str::to_owned).context("選択を中止しました");
-        }
-        match if email {
-            validate_email(value)
-        } else {
-            validate_label(value)
-        } {
-            Ok(()) => return Ok(value.to_owned()),
-            Err(error) => writeln!(output, "{error}")?,
-        }
-    }
+    )
 }
-fn configure(
-    all: &[Account],
-    profiles: &mut Profiles,
-    current: Option<&str>,
-    input: &mut dyn io::BufRead,
-    output: &mut dyn Write,
-) -> Result<()> {
-    let mut groups = BTreeMap::new();
-    for account in all {
-        groups
-            .entry(&account.account)
-            .or_insert_with(Vec::new)
-            .push(account);
-    }
-    if groups.is_empty() {
-        bail!("保存済みアカウントがありません。");
-    }
-    let mut updated = profiles.clone();
-    for (id, organizations) in groups {
-        writeln!(output, "アカウント設定:")?;
-        for account in &organizations {
-            writeln!(output, "  {}", profiles.label(account, current))?;
-        }
-        let old = profiles.accounts.get(id);
-        let email = read_label(
-            "メールアドレス（ユーザー登録・認証確認ではありません）",
-            old.map(|p| p.email.as_str()),
-            true,
-            input,
-            output,
-        )?;
-        let mut names = BTreeMap::new();
-        for account in &organizations {
-            writeln!(output, "  {}", profiles.label(account, current))?;
-            let name = read_label(
-                "組織の表示名",
-                old.and_then(|p| p.organizations.get(&account.org))
-                    .map(String::as_str),
-                false,
-                input,
-                output,
-            )?;
-            names.insert(account.org.clone(), name);
-        }
-        let selected = if organizations.len() == 1 {
-            organizations[0]
-        } else {
-            writeln!(output, "{email} の同期対象組織（1個）:")?;
-            for (index, account) in organizations.iter().enumerate() {
-                writeln!(
-                    output,
-                    "  {}: {} / {} / 履歴={}件{}",
-                    index + 1,
-                    email,
-                    names[&account.org],
-                    account.sessions,
-                    if current == Some(id.as_str()) {
-                        " [Desktop保存情報の現在候補]"
-                    } else {
-                        ""
-                    }
-                )?;
-            }
-            organizations[read_choice(input, output, organizations.len())? - 1]
-        };
-        updated.accounts.insert(
-            id.clone(),
-            Profile {
-                email,
-                selected_org: selected.org.clone(),
-                organizations: names,
-            },
-        );
-    }
-    *profiles = updated;
-    Ok(())
-}
-fn choose(label: &str, options: &[Account], profiles: &Profiles, current: &str) -> Result<Account> {
+fn choose(label: &str, options: &[Account], current: &str) -> Result<Account> {
     match options {
         [] => bail!("{label}の候補がありません。accountsで保存状態を確認してください。"),
         [only] => {
-            println!("{label}: {}", profiles.label(only, Some(current)));
+            println!("{label}: {}", account_label(only, Some(current)));
             Ok(only.clone())
         }
         _ => {
             println!("{label}を選んでください:");
             for (i, account) in options.iter().enumerate() {
-                println!("  {}: {}", i + 1, profiles.label(account, Some(current)));
+                println!("  {}: {}", i + 1, account_label(account, Some(current)));
             }
             if !io::stdin().is_terminal() {
                 bail!("候補が複数あります。--from / --from-org / --to-orgで指定してください。");
@@ -511,96 +373,17 @@ mod tests {
         }
     }
     #[test]
-    fn configure_three_accounts_and_eof_preserves_settings() {
-        let all: Vec<_> = ["a", "b", "c"]
-            .into_iter()
-            .map(|id| Account {
-                account: id.into(),
-                org: "org".into(),
-                sessions: 2,
-            })
-            .collect();
-        let mut profiles = Profiles::default();
-        let mut output = Vec::new();
-        configure(
-            &all,
-            &mut profiles,
-            Some("b"),
-            &mut Cursor::new(
-                "a@example.com\nPersonal\nb@example.com\nWork\nc@example.com\nResearch\n",
-            ),
-            &mut output,
-        )
-        .unwrap();
-        assert_eq!(profiles.selected(&all).unwrap().len(), 3);
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("Desktop保存情報の現在候補")
-        );
-        let before = profiles.clone();
-        assert!(
-            configure(
-                &all,
-                &mut profiles,
-                None,
-                &mut Cursor::new("new@example.com\nNew\n"),
-                &mut Vec::new()
-            )
-            .is_err()
-        );
-        assert_eq!(before, profiles);
-    }
-    #[test]
-    fn configure_requires_numbered_organization_selection() {
-        let all = vec![
-            Account {
-                account: "a".into(),
-                org: "first".into(),
-                sessions: 1,
-            },
-            Account {
-                account: "a".into(),
-                org: "second".into(),
-                sessions: 4,
-            },
-        ];
-        let mut profiles = Profiles::default();
-        let mut output = Vec::new();
-        configure(
-            &all,
-            &mut profiles,
-            None,
-            &mut Cursor::new("a@example.com\nPersonal\nTeam\n2\n"),
-            &mut output,
-        )
-        .unwrap();
-        assert_eq!(profiles.accounts["a"].selected_org, "second");
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("2: a@example.com / Team / 履歴=4件")
-        );
-    }
-    #[test]
-    fn dry_run_sync_parses_and_loads_no_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("missing/accounts.json");
-        let cli = Cli::try_parse_from([
-            "claudeHistory",
-            "--profiles-file",
-            path.to_str().unwrap(),
-            "sync",
-            "--dry-run",
-        ])
-        .unwrap();
+    fn sync_parses_without_registration_arguments() {
+        let cli = Cli::try_parse_from(["claudeHistory", "sync", "--dry-run"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Sync { dry_run: true })));
-        Profiles::load(cli.profiles_file.as_ref().unwrap()).unwrap();
-        assert!(!path.parent().unwrap().exists());
+        assert!(Cli::try_parse_from(["claudeHistory", "configure"]).is_err());
+        assert!(
+            Cli::try_parse_from(["claudeHistory", "--profiles-file", "accounts.json"]).is_err()
+        );
+        assert!(matches!(
+            menu(&mut Cursor::new("3\n"), &mut Vec::new()).unwrap(),
+            Command::Status
+        ));
     }
 
     #[test]

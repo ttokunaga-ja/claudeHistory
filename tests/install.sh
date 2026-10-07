@@ -8,7 +8,7 @@ cp "$task_root/target/release/claudeHistory" "$task_test/package/claudeHistory"
 cp "$task_root/scripts/install.sh" "$task_test/package/install.sh"
 (cd "$task_test/package" && shasum -a 256 claudeHistory > SHA256SUMS)
 sh "$task_test/package/install.sh" "$task_test/bin"
-test "$("$task_test/bin/claudeHistory" --version)" = 'claudeHistory 0.4.1'
+test "$("$task_test/bin/claudeHistory" --version)" = 'claudeHistory 0.5.0'
 task_good=$(shasum -a 256 "$task_test/bin/claudeHistory" | awk '{print $1}')
 printf '%064d  claudeHistory\n' 0 > "$task_test/package/SHA256SUMS"
 if sh "$task_test/package/install.sh" "$task_test/bin"; then exit 1; fi

@@ -360,21 +360,21 @@ impl Store {
         })
     }
     pub fn plan_sync(&self, accounts: &[Account]) -> Result<SyncPlan> {
-        ensure!(accounts.len() >= 2, "sync requires at least two accounts");
+        ensure!(
+            accounts.len() >= 2,
+            "sync requires at least two account/organization stores"
+        );
         let mut accounts = accounts.to_vec();
         accounts.sort_by(|a, b| (&a.account, &a.org).cmp(&(&b.account, &b.org)));
-        ensure!(
-            accounts
-                .windows(2)
-                .all(|w| !w[0].account.eq_ignore_ascii_case(&w[1].account)),
-            "sync requires distinct account UUIDs and one organization per account"
-        );
-        // Validate case-insensitive identity independently of textual sort order.
+        // Each organization is an independent store, including those owned by the same account.
         let unique: std::collections::BTreeSet<_> = accounts
             .iter()
-            .map(|a| a.account.to_ascii_lowercase())
+            .map(|a| (a.account.to_ascii_lowercase(), a.org.to_ascii_lowercase()))
             .collect();
-        ensure!(unique.len() == accounts.len(), "duplicate account UUID");
+        ensure!(
+            unique.len() == accounts.len(),
+            "duplicate account/organization store"
+        );
         let mut snapshots = Vec::new();
         let mut union = BTreeMap::<String, Value>::new();
         for account in &accounts {
@@ -649,7 +649,10 @@ impl Store {
         let mut identities = std::collections::BTreeSet::new();
         for p in &manifest.participants {
             ensure!(
-                identities.insert(p.account.account.to_ascii_lowercase()),
+                identities.insert((
+                    p.account.account.to_ascii_lowercase(),
+                    p.account.org.to_ascii_lowercase(),
+                )),
                 "duplicate transaction participant"
             );
             self.dir(&p.account)?;

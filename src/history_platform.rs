@@ -169,17 +169,6 @@ pub fn private_dir(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
-pub fn private_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-#[cfg(windows)]
-pub fn private_file(path: &Path) -> Result<()> {
-    private_dir(path)
-}
-
 // Per-thread fault injection exercises the critical publish -> directory fsync
 // failure window without affecting other tests or production builds.
 #[cfg(test)]

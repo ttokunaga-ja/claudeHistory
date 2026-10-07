@@ -60,8 +60,126 @@ fn three_account_union_repeat_and_single_undo() {
         assert_eq!(fs::read_dir(dir(&store, a)).unwrap().count(), 1);
     }
 }
+fn move_to_org(store: &Store, account: &mut Account, account_id: &str, org: &str) {
+    let original = dir(store, account);
+    account.account = account_id.to_owned();
+    account.org = org.to_owned();
+    let destination = dir(store, account);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::rename(original, destination).unwrap();
+}
 #[test]
-fn global_collision_and_duplicate_account_abort() {
+fn same_account_two_organizations_union_repeat_and_undo() {
+    let (_temp, store, mut accounts) = fixture();
+    let account_id = accounts[0].account.clone();
+    move_to_org(
+        &store,
+        &mut accounts[1],
+        &account_id,
+        "00000001-0000-4000-8000-000000000000",
+    );
+    accounts.truncate(2);
+    // Match the common empty-organization plus populated-organization case.
+    fs::remove_file(dir(&store, &accounts[0]).join(name(0))).unwrap();
+    let plan = store.plan_sync(&accounts).unwrap();
+    assert_eq!(plan.targets[0].additions, 1);
+    assert_eq!(plan.targets[1].additions, 0);
+    let backup = store.apply_sync(&plan).unwrap();
+    for account in &accounts {
+        assert_eq!(fs::read_dir(dir(&store, account)).unwrap().count(), 1);
+    }
+    assert!(
+        store
+            .plan_sync(&accounts)
+            .unwrap()
+            .targets
+            .iter()
+            .all(|t| t.additions == 0)
+    );
+    assert_eq!(store.undo(&backup).unwrap(), 1);
+    assert_eq!(fs::read_dir(dir(&store, &accounts[0])).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(dir(&store, &accounts[1])).unwrap().count(), 1);
+}
+#[test]
+fn multiple_accounts_and_organizations_union_repeat_and_undo() {
+    let (_temp, store, mut accounts) = fixture();
+    let account_id = accounts[0].account.clone();
+    move_to_org(
+        &store,
+        &mut accounts[1],
+        &account_id,
+        "00000001-0000-4000-8000-000000000000",
+    );
+    move_to_org(
+        &store,
+        &mut accounts[2],
+        "00000003-0000-4000-8000-000000000000",
+        "00000002-0000-4000-8000-000000000000",
+    );
+    let backup = store
+        .apply_sync(&store.plan_sync(&accounts).unwrap())
+        .unwrap();
+    for account in &accounts {
+        assert_eq!(fs::read_dir(dir(&store, account)).unwrap().count(), 3);
+    }
+    assert!(
+        store
+            .plan_sync(&accounts)
+            .unwrap()
+            .targets
+            .iter()
+            .all(|t| t.additions == 0)
+    );
+    assert_eq!(store.undo(&backup).unwrap(), 6);
+    for account in &accounts {
+        assert_eq!(fs::read_dir(dir(&store, account)).unwrap().count(), 1);
+    }
+}
+#[test]
+fn same_account_organization_sync_guard_failure_rolls_back_all_stores() {
+    let (_temp, store, mut accounts) = fixture();
+    let account_id = accounts[0].account.clone();
+    move_to_org(
+        &store,
+        &mut accounts[1],
+        &account_id,
+        "00000001-0000-4000-8000-000000000000",
+    );
+    accounts.truncate(2);
+    let mut calls = 0;
+    let result = store.apply_sync_checked(&store.plan_sync(&accounts).unwrap(), || {
+        calls += 1;
+        if calls == 3 {
+            anyhow::bail!("activity resumed");
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    for (i, account) in accounts.iter().enumerate() {
+        let entries: Vec<_> = fs::read_dir(dir(&store, account))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(name(i))]);
+    }
+}
+#[test]
+fn duplicate_storage_pair_rejected_case_insensitively() {
+    let (_temp, store, mut accounts) = fixture();
+    move_to_org(
+        &store,
+        &mut accounts[0],
+        "abcdef01-0000-4000-8000-000000000000",
+        "abcdef02-0000-4000-8000-000000000000",
+    );
+    let mut duplicate = accounts[0].clone();
+    duplicate.account = duplicate.account.to_ascii_uppercase();
+    duplicate.org = duplicate.org.to_ascii_uppercase();
+    assert!(store.plan_sync(&[accounts[0].clone(), duplicate]).is_err());
+    assert!(!store.backup_root.exists());
+}
+#[test]
+fn global_collision_and_duplicate_storage_pair_abort() {
     let (_temp, store, accounts) = fixture();
     fs::copy(
         dir(&store, &accounts[0]).join(name(0)),

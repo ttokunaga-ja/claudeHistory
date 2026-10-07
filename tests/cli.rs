@@ -4,70 +4,108 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
-#[test]
-fn three_account_labels_dry_run_and_clean_menu_abort() {
+fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let t = tempfile::tempdir().unwrap();
-    let base = t.path().canonicalize().unwrap();
-    let data = base.join("Claude");
-    let profiles = base.join("accounts.json");
-    let org = "00000000-0000-4000-8000-000000000000";
-    let mut settings = serde_json::Map::new();
-    for i in 1..=3 {
-        let a = format!("{i:08}-0000-4000-8000-000000000000");
-        let p = data.join("claude-code-sessions").join(&a).join(org);
-        fs::create_dir_all(&p).unwrap();
-        let session = format!("local_{:08}-0000-4000-8000-000000000000", i + 10);
-        fs::write(
-            p.join(format!("{session}.json")),
-            json!({"sessionId":session,"cwd":base.join("project")}).to_string(),
+    let data = t.path().canonicalize().unwrap().join("Claude");
+    let account = "00000001-0000-4000-8000-000000000000";
+    for i in 1..=2 {
+        fs::create_dir_all(
+            data.join("claude-code-sessions")
+                .join(account)
+                .join(format!("{i:08}-0000-4000-8000-000000000000")),
         )
         .unwrap();
-        settings.insert(a.clone(),json!({"email":format!("user{i}@example.com"),"selected_org":org,"organizations":{org:"Personal"}}));
     }
     fs::write(
         data.join("config.json"),
-        json!({"lastKnownAccountUuid":"00000002-0000-4000-8000-000000000000"}).to_string(),
+        json!({"lastKnownAccountUuid":account}).to_string(),
     )
     .unwrap();
-    fs::write(&profiles, json!({"accounts":settings}).to_string()).unwrap();
-    let original = fs::read(&profiles).unwrap();
-    let run = |args: &[&str]| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_claudeHistory"));
-        c.arg("--data-dir")
-            .arg(&data)
-            .arg("--cli-dir")
-            .arg(base.join("cli"))
-            .arg("--profiles-file")
-            .arg(&profiles)
-            .args(args);
-        c
-    };
-    let result = run(&["sync", "--dry-run"]).output().unwrap();
+    (t, data)
+}
+
+#[test]
+fn menu_one_syncs_all_organizations_without_registration_or_confirmation() {
+    let (t, data) = fixture();
+    let malformed = t.path().join(".claude-history/accounts.json");
+    fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+    fs::write(&malformed, b"invalid json").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+        .env("HOME", t.path())
+        .env("USERPROFILE", t.path())
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--cli-dir")
+        .arg(t.path().join("cli"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"1\n").unwrap();
+    let result = child.wait_with_output().unwrap();
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let output = String::from_utf8(result.stdout).unwrap();
-    for i in 1..=3 {
-        assert!(output.contains(&format!("user{i}@example.com / Personal")));
-    }
-    assert!(output.contains("追加=2件"));
+    assert!(!output.contains("メールアドレス"));
+    assert!(!output.contains("アカウント設定"));
+    assert!(!output.contains("Yes/No"));
+    assert_eq!(output.matches("追加=0件").count(), 2);
+    assert_eq!(fs::read(malformed).unwrap(), b"invalid json");
+}
+
+#[test]
+fn sync_dry_run_includes_empty_and_populated_organizations_without_settings() {
+    let (t, data) = fixture();
+    let populated = data.join("claude-code-sessions/00000001-0000-4000-8000-000000000000/00000002-0000-4000-8000-000000000000");
+    let session = "local_00000010-0000-4000-8000-000000000000";
+    fs::write(
+        populated.join(format!("{session}.json")),
+        json!({"sessionId":session,"cwd":t.path().join("project")}).to_string(),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+        .env("HOME", t.path())
+        .env("USERPROFILE", t.path())
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--cli-dir")
+        .arg(t.path().join("cli"))
+        .args(["sync", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("追加=1件"));
+    assert!(output.contains("追加=0件"));
     assert!(output.contains("Desktop保存情報の現在候補"));
-    assert_eq!(fs::read(&profiles).unwrap(), original);
-    for i in 1..=3 {
-        assert_eq!(
-            fs::read_dir(
-                data.join("claude-code-sessions")
-                    .join(format!("{i:08}-0000-4000-8000-000000000000"))
-                    .join(org)
-            )
-            .unwrap()
-            .count(),
-            1
-        );
+    assert!(!output.contains("メールアドレス"));
+    assert_eq!(fs::read_dir(populated).unwrap().count(), 1);
+}
+
+#[test]
+fn removed_registration_commands_are_rejected_and_menu_abort_is_clean() {
+    for args in [
+        vec!["configure"],
+        vec!["--profiles-file", "accounts.json", "accounts"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
     }
-    let mut child = run(&[])
+    let (_t, data) = fixture();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+        .arg("--data-dir")
+        .arg(data)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -84,12 +122,11 @@ fn three_account_labels_dry_run_and_clean_menu_abort() {
 #[test]
 fn maintenance_commands_are_available_without_loading_claude_data() {
     let t = tempfile::tempdir().unwrap();
-    let malformed = t.path().join("accounts.json");
+    let malformed = t.path().join(".claude-history/accounts.json");
+    fs::create_dir_all(malformed.parent().unwrap()).unwrap();
     fs::write(&malformed, b"invalid json").unwrap();
     for command in ["update", "uninstall"] {
         let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
-            .arg("--profiles-file")
-            .arg(&malformed)
             .arg("--data-dir")
             .arg(t.path().join("missing"))
             .args([command, "--help"])
@@ -103,8 +140,6 @@ fn maintenance_commands_are_available_without_loading_claude_data() {
         assert!(String::from_utf8_lossy(&result.stdout).contains(command));
     }
     let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
-        .arg("--profiles-file")
-        .arg(&malformed)
         .arg("--data-dir")
         .arg(t.path().join("missing"))
         .arg("uninstall")
