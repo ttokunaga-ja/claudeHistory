@@ -5,6 +5,6 @@
 - `sh tests/install.sh`で正常インストール、破損チェックサム、重複チェックサムの拒否と既存バイナリ保持を検証。インストール先は破棄可能なfixtureフォルダー。
 - このMacの実行ファイルで`status`と`transfer --dry-run`を実行。実際のClaude CLIとDesktop子プロセスを検知し、作業中メッセージを確認。実データの書き込みとプロセス終了は実行していない。
 - 実際のDesktopをYes選択で終了する操作と、生成した初版による実会話の続行は未検証。過去の手動復旧とfixture成功を初版の実機受入と同一視しない。
-- 配布物はmacOS Apple Silicon向けのローカルパッケージ。Intel実機、Windows、署名・公証、GitHub公開Releaseは未実施。
+- 配布物はmacOS Apple Silicon向けのパッケージ。Intel実機、Windows、署名・公証は未実施。公開ReleaseはGitHub Actionsを使わず、ローカル検証済みの成果物をアップロードする。
 
 機械的な検出に完全性はない。CLI対話待ち、Desktopの待機TCP接続も保守的に中止する。安全な終了を判定できない場合は、ユーザーが作業を終え、Desktop・CLIを手動終了してから実行する。

@@ -6,7 +6,14 @@
 
 ## 使い方
 
-アカウント切り替え後に実行します。初版の配布物はローカルで生成し、公開Releaseはまだ作成していません。
+アカウント切り替え後に実行します。[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-macos-arm64.tar.gz`をダウンロードして展開し、同梱の`install.sh`を実行してください。配布版はApple Silicon向けです。
+
+```sh
+tar -xzf claudeHistory-macos-arm64.tar.gz
+sh claudeHistory-macos-arm64/install.sh
+```
+
+`~/.local/bin/claudeHistory`へインストールします。SHA-256と版の検証に失敗した場合は既存の実行ファイルを置き換えません。`~/.local/bin`をPATHに追加してから利用してください。
 
 ```sh
 claudeHistory accounts
@@ -68,4 +75,4 @@ sh tests/install.sh
 sh /path/to/extracted-package/install.sh
 ```
 
-外部公開、署名・公証、Windows対応は未実施です。`SPEC.md`が初版の要件と受入範囲です。
+署名・公証、Intel実機検証、Windows対応は未実施です。`SPEC.md`が初版の要件と受入範囲です。
