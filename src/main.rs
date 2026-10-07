@@ -1,3 +1,5 @@
+mod uninstall;
+mod update;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use claude_history::{
@@ -33,6 +35,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 最新の公開リリースへCLI本体を更新
+    Update,
+    /// 確認後にCLI本体だけを削除（履歴・設定・バックアップは保持）
+    Uninstall,
     /// 全登録アカウントへ不足履歴を同期
     Sync {
         #[arg(long)]
@@ -72,6 +78,11 @@ fn run() -> Result<()> {
     if !cfg!(any(target_os = "macos", target_os = "windows")) {
         bail!("この版はmacOSとWindowsに対応しています。");
     }
+    match &cli.command {
+        Some(Command::Update) => return update::run(),
+        Some(Command::Uninstall) => return uninstall::run(),
+        _ => {}
+    }
     let home = dirs::home_dir().context("ホームフォルダーを取得できません")?;
     let data_root = cli
         .data_dir
@@ -99,6 +110,9 @@ fn run() -> Result<()> {
         Profiles::load(&profiles_path)?
     };
     match command {
+        Command::Update | Command::Uninstall => {
+            unreachable!("maintenance commands handled before history access")
+        }
         Command::Configure => {
             let all = store.accounts()?;
             let current = store.current_account()?;

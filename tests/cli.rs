@@ -80,3 +80,41 @@ fn three_account_labels_dry_run_and_clean_menu_abort() {
     assert!(error.contains("選択を中止しました"));
     assert!(!error.contains("parse"));
 }
+
+#[test]
+fn maintenance_commands_are_available_without_loading_claude_data() {
+    let t = tempfile::tempdir().unwrap();
+    let malformed = t.path().join("accounts.json");
+    fs::write(&malformed, b"invalid json").unwrap();
+    for command in ["update", "uninstall"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+            .arg("--profiles-file")
+            .arg(&malformed)
+            .arg("--data-dir")
+            .arg(t.path().join("missing"))
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains(command));
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_claudeHistory"))
+        .arg("--profiles-file")
+        .arg(&malformed)
+        .arg("--data-dir")
+        .arg(t.path().join("missing"))
+        .arg("uninstall")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(&malformed).unwrap(), b"invalid json");
+}
