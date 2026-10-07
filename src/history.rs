@@ -6,9 +6,11 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, io::AsRawFd},
     path::{Component, Path, PathBuf},
 };
+
+#[path = "history_platform.rs"]
+mod platform;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
@@ -32,6 +34,8 @@ type Snapshot = BTreeMap<String, String>;
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
+    #[serde(default)]
+    directory_sync: String,
     root: PathBuf,
     source: Account,
     target: Account,
@@ -70,12 +74,13 @@ fn safe_path(path: &Path) -> Result<()> {
             "parent traversal rejected"
         );
         prefix.push(component);
+        // A Windows drive/UNC prefix alone is not an absolute filesystem path.
+        // Inspect it only once the following root component has been appended.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&prefix) {
-            Ok(m) => ensure!(
-                !m.file_type().is_symlink(),
-                "symlink rejected: {}",
-                prefix.display()
-            ),
+            Ok(m) => platform::reject_redirect(&m, &prefix)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -85,7 +90,8 @@ fn safe_path(path: &Path) -> Result<()> {
 fn private_dir(path: &Path) -> Result<()> {
     safe_path(path)?;
     fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    safe_path(path)?;
+    platform::private_dir(path)?;
     Ok(())
 }
 fn atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -93,7 +99,8 @@ fn atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = tempfile::NamedTempFile::new_in(path.parent().context("missing parent")?)?;
     f.write_all(bytes)?;
     f.as_file().sync_all()?;
-    f.persist_noclobber(path).map_err(|e| e.error)?;
+    platform::publish(f, path, false)?;
+    platform::sync_dir(path.parent().context("missing parent")?)?;
     Ok(())
 }
 fn journal(path: &Path, manifest: &Manifest) -> Result<()> {
@@ -101,8 +108,8 @@ fn journal(path: &Path, manifest: &Manifest) -> Result<()> {
     let mut f = tempfile::NamedTempFile::new_in(path.parent().context("journal parent missing")?)?;
     f.write_all(&serde_json::to_vec_pretty(manifest)?)?;
     f.as_file().sync_all()?;
-    f.persist(path).map_err(|e| e.error)?;
-    fs::File::open(path.parent().context("journal parent missing")?)?.sync_all()?;
+    platform::publish(f, path, true)?;
+    platform::sync_dir(path.parent().context("journal parent missing")?)?;
     Ok(())
 }
 fn read(path: &Path) -> Result<Vec<u8>> {
@@ -212,24 +219,24 @@ fn sanitized(v: &Value) -> Result<Vec<u8>> {
 struct MutationLock(fs::File);
 impl MutationLock {
     fn acquire(root: &Path) -> Result<Self> {
-        let path = root.join("claude-code-sessions");
+        use fs2::FileExt;
+        let path = root.join(".claude-history.lock");
         safe_path(&path)?;
-        let file = fs::File::open(path)?;
-        // Advisory lock coordinates tool instances; the Desktop app does not participate.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        ensure!(
-            result == 0,
-            "another history mutation is running: {}",
-            std::io::Error::last_os_error()
-        );
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        safe_path(&path)?;
+        file.try_lock_exclusive()
+            .context("another history mutation is running")?;
         Ok(Self(file))
     }
 }
 impl Drop for MutationLock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = fs2::FileExt::unlock(&self.0);
     }
 }
 impl Store {
@@ -367,6 +374,7 @@ impl Store {
         }
         let mut manifest = Manifest {
             version: 1,
+            directory_sync: platform::DIRECTORY_SYNC.into(),
             root: self.root.clone(),
             source: plan.source.clone(),
             target: plan.target.clone(),
@@ -385,7 +393,7 @@ impl Store {
         // The intent is durable before any target pointer is published. Incomplete
         // journals are retained for manual recovery and never automatically undone.
         atomic_new(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
-        fs::File::open(&backup)?.sync_all()?;
+        platform::sync_dir(&backup)?;
         let result = (|| -> Result<()> {
             before_write()?;
             ensure!(
@@ -403,7 +411,7 @@ impl Store {
                 journal(&manifest_path, &manifest)?;
                 atomic_new(&dst.join(name), bytes)?;
                 manifest.created.insert(name.clone(), hash(bytes));
-                fs::File::open(&dst)?.sync_all()?;
+                platform::sync_dir(&dst)?;
                 manifest.pending = None;
                 journal(&manifest_path, &manifest)?;
             }
@@ -424,7 +432,10 @@ impl Store {
                 let path = dst.join(name);
                 let outcome = match read(&path) {
                     Ok(bytes) if hash(&bytes) == *h => match fs::remove_file(&path) {
-                        Ok(()) => "removed".into(),
+                        Ok(()) => match platform::sync_dir(&dst) {
+                            Ok(()) => "removed".into(),
+                            Err(error) => format!("removed: directory sync failed: {error}"),
+                        },
                         Err(error) => format!("retained: removal failed: {error}"),
                     },
                     Ok(_) => "retained: modified".into(),
@@ -494,6 +505,8 @@ impl Store {
                     "registration changed during undo"
                 );
                 fs::remove_file(dst.join(name))?;
+                removed.push(name.clone());
+                platform::sync_dir(&dst)?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -505,7 +518,6 @@ impl Store {
                 }
                 bail!("undo failed: {e}; restoration failures: {failed:?}");
             }
-            removed.push(name.clone());
         }
         Ok(m.created.len())
     }

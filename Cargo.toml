@@ -1,6 +1,6 @@
 [package]
 name = "claude-history"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Restore local Claude Desktop Code session listings across accounts"
@@ -18,7 +18,13 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 walkdir = "2"
+fs2 = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 strip = true

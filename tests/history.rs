@@ -14,7 +14,7 @@ fn fixture() -> (tempfile::TempDir, Store, Account, Account, PathBuf) {
     };
     let p = store.root.join("claude-code-sessions").join(A).join(O);
     fs::create_dir_all(&p).unwrap();
-    fs::write(p.join(format!("{S}.json")), serde_json::to_vec(&json!({"sessionId":S,"cwd":"/tmp/project","title":"Example","permissionMode":"bypassPermissions","permissionGrants":["all"],"auth":"secret","mcpServers":{"x":{}},"unknown":"discard"})).unwrap()).unwrap();
+    fs::write(p.join(format!("{S}.json")), serde_json::to_vec(&json!({"sessionId":S,"cwd":base.join("project"),"title":"Example","permissionMode":"bypassPermissions","permissionGrants":["all"],"auth":"secret","mcpServers":{"x":{}},"unknown":"discard"})).unwrap()).unwrap();
     let source = Account {
         account: A.into(),
         org: O.into(),
@@ -122,14 +122,19 @@ fn conflict_malformed_and_symlink_rejected() {
     fs::create_dir_all(dest.parent().unwrap()).unwrap();
     fs::write(
         &dest,
-        serde_json::to_vec(&json!({"sessionId":S,"cwd":"/different"})).unwrap(),
+        serde_json::to_vec(&json!({"sessionId":S,"cwd":dest.parent().unwrap().join("different")}))
+            .unwrap(),
     )
     .unwrap();
     assert!(store.plan(&source, &target).is_err());
     fs::remove_file(&dest).unwrap();
-    std::os::unix::fs::symlink("/tmp", dest.parent().unwrap().join("bad")).unwrap();
-    assert!(store.plan(&source, &target).is_err());
-    fs::remove_file(dest.parent().unwrap().join("bad")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dest.parent().unwrap(), dest.parent().unwrap().join("bad"))
+            .unwrap();
+        assert!(store.plan(&source, &target).is_err());
+        fs::remove_file(dest.parent().unwrap().join("bad")).unwrap();
+    }
     fs::write(
         store
             .root
@@ -155,7 +160,7 @@ fn rejects_relative_origin_and_preserves_existing_registrations() {
     value["originCwd"] = json!("../outside");
     fs::write(&src, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(store.plan(&source, &target).is_err());
-    value["originCwd"] = json!("/tmp/project");
+    value["originCwd"] = json!(store.root.join("project"));
     fs::write(&src, serde_json::to_vec(&value).unwrap()).unwrap();
     fs::create_dir_all(dest.parent().unwrap()).unwrap();
     let existing = serde_json::to_vec(&value).unwrap();
@@ -199,30 +204,39 @@ fn ordinary_operational_files_ignored_and_actual_permissions_reset() {
 }
 #[test]
 fn mutation_lock_blocks_apply_and_undo_without_writes() {
-    use std::os::unix::io::AsRawFd;
+    use fs2::FileExt;
     let (_t, store, source, target, dest) = fixture();
     let plan = store.plan(&source, &target).unwrap();
-    let directory = fs::File::open(store.root.join("claude-code-sessions")).unwrap();
-    assert_eq!(
-        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(store.root.join(".claude-history.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "mutation_lock_subprocess_probe", "--nocapture"])
+        .env("CLAUDE_HISTORY_LOCK_TEST_ROOT", &store.root)
+        .env("CLAUDE_HISTORY_LOCK_TEST_BACKUP", &store.backup_root)
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
     );
     assert!(store.apply(&plan).is_err());
     assert!(!dest.exists());
-    assert_eq!(
-        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) },
-        0
-    );
+    FileExt::unlock(&lock).unwrap();
     let backup = store.apply(&plan).unwrap();
-    assert_eq!(
-        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
+    lock.try_lock_exclusive().unwrap();
     assert!(store.undo(&backup).is_err());
     assert!(dest.exists());
 }
 #[test]
 fn undo_checks_all_pointers_and_original_backup_permissions() {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let (_t, store, source, target, dest) = fixture();
     let second = "local_55555555-5555-4555-8555-555555555555.json";
@@ -230,16 +244,18 @@ fn undo_checks_all_pointers_and_original_backup_permissions() {
     fs::write(
         src.join(second),
         serde_json::to_vec(
-            &json!({"sessionId":second.trim_end_matches(".json"),"cwd":"/tmp/second"}),
+            &json!({"sessionId":second.trim_end_matches(".json"),"cwd":store.root.join("second")}),
         )
         .unwrap(),
     )
     .unwrap();
     let backup = store.apply(&store.plan(&source, &target).unwrap()).unwrap();
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(backup.join("originals").join(second))
             .unwrap()
@@ -254,6 +270,7 @@ fn undo_checks_all_pointers_and_original_backup_permissions() {
     assert!(dest.exists());
     assert_eq!(fs::read_to_string(second_dest).unwrap(), "new work");
 }
+#[cfg(unix)]
 #[test]
 fn failed_publication_retains_incomplete_recovery_journal() {
     use std::os::unix::fs::PermissionsExt;
@@ -284,4 +301,102 @@ fn failed_publication_retains_incomplete_recovery_journal() {
             .to_string()
             .contains("incomplete")
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_ancestor_rejected_and_private_acl_reported() {
+    use std::process::Command;
+    let (t, store, source, target, _dest) = fixture();
+    let junction = t.path().join("junction");
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(t.path().join("Claude"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let redirected = Store {
+        root: junction,
+        backup_root: store.backup_root.clone(),
+    };
+    assert!(redirected.plan(&source, &target).is_err());
+    let backup = store.apply(&store.plan(&source, &target).unwrap()).unwrap();
+    let acl = Command::new("icacls").arg(&backup).output().unwrap();
+    assert!(acl.status.success());
+    let acl = String::from_utf8_lossy(&acl.stdout);
+    assert!(
+        !acl.contains("(I)"),
+        "backup must not inherit an ambient ACL: {acl}"
+    );
+    let verify = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", r#"
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$paths = @($env:CLAUDE_HISTORY_TEST_BACKUP) + @(Get-ChildItem -LiteralPath $env:CLAUDE_HISTORY_TEST_BACKUP -Recurse | ForEach-Object FullName)
+foreach ($path in $paths) {
+  $acl = Get-Acl -LiteralPath $path
+  $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow') { throw 'Backup ACL is not user-only' }
+}
+"#]).env("CLAUDE_HISTORY_TEST_BACKUP", &backup).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["directory_sync"],
+        "unavailable-windows-write-through-renames"
+    );
+    fs::remove_dir(t.path().join("junction")).unwrap();
+}
+
+#[test]
+fn publication_never_clobbers_a_registration_created_after_guard() {
+    let (_t, store, source, target, dest) = fixture();
+    let plan = store.plan(&source, &target).unwrap();
+    let mut checks = 0;
+    let result = store.apply_checked(&plan, || {
+        checks += 1;
+        if checks == 2 {
+            fs::write(&dest, "concurrent user work")?;
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "concurrent user work");
+}
+
+#[test]
+fn mutation_lock_subprocess_probe() {
+    let Some(root) = std::env::var_os("CLAUDE_HISTORY_LOCK_TEST_ROOT") else {
+        return;
+    };
+    let store = Store {
+        root: root.into(),
+        backup_root: std::env::var_os("CLAUDE_HISTORY_LOCK_TEST_BACKUP")
+            .unwrap()
+            .into(),
+    };
+    let source = Account {
+        account: A.into(),
+        org: O.into(),
+        sessions: 1,
+    };
+    let target = Account {
+        account: B.into(),
+        org: O.into(),
+        sessions: 0,
+    };
+    let plan = store.plan(&source, &target).unwrap();
+    assert!(
+        store
+            .apply(&plan)
+            .unwrap_err()
+            .to_string()
+            .contains("another history mutation")
+    );
+    assert!(!store.backup_root.exists());
 }

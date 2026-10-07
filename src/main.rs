@@ -16,7 +16,7 @@ use std::{
     about = "Claude Desktop Codeのローカル履歴を別アカウントへ引き継ぐ"
 )]
 struct Cli {
-    /// Claude Desktopのデータフォルダー（既定: macOS標準）
+    /// Claude Desktopのデータフォルダー（既定: macOS / Windows標準）
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
     /// Claude CLIの設定フォルダー（既定: CLAUDE_CONFIG_DIR または ~/.claude）
@@ -57,13 +57,14 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if !cfg!(target_os = "macos") {
-        bail!("この版はmacOS専用です。Windows版は未検証のため提供していません。");
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        bail!("この版はmacOSとWindowsに対応しています。");
     }
     let home = dirs::home_dir().context("ホームフォルダーを取得できません")?;
     let data_root = cli
         .data_dir
-        .unwrap_or_else(|| home.join("Library/Application Support/Claude"));
+        .map(Ok)
+        .unwrap_or_else(|| claude_history::platform::default_data_root(&home))?;
     let cli_root = cli
         .cli_dir
         .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))

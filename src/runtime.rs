@@ -1,10 +1,32 @@
 //! Conservative, read-only activity observation. No process arguments enter diagnostics.
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+mod macos;
+mod windows;
+#[cfg(not(target_os = "windows"))]
+use macos as platform;
+#[cfg(target_os = "windows")]
+use windows as platform;
+
+#[doc(hidden)]
+pub fn classify_windows_fixture(
+    snapshot: &str,
+    local_app_data: &str,
+    self_pid: u32,
+) -> Result<Activity> {
+    windows::classify_fixture(snapshot, local_app_data, self_pid)
+}
+#[doc(hidden)]
+pub fn windows_argv_fixture(command: &str) -> Result<Vec<String>> {
+    windows::argv(command)
+}
+#[doc(hidden)]
+pub fn windows_tcp_fixture(snapshot: &str, pids: &[i32]) -> Result<bool> {
+    windows::tcp_output(snapshot, pids)
+}
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -23,63 +45,7 @@ struct Process {
     executable: String,
     args: Vec<String>,
 }
-fn parse(snapshot: &str) -> Result<Vec<Process>> {
-    snapshot
-        .lines()
-        .filter(|s| !s.trim().is_empty())
-        .map(|line| {
-            let line = line.trim();
-            let (pid, rest) = line
-                .split_once(char::is_whitespace)
-                .context("invalid process snapshot")?;
-            let (ppid, exe) = rest
-                .trim_start()
-                .split_once(char::is_whitespace)
-                .context("invalid process snapshot")?;
-            let pid: i32 = pid.parse()?;
-            let ppid: i32 = ppid.parse()?;
-            if pid <= 0 || ppid < 0 || exe.trim().is_empty() {
-                bail!("invalid process snapshot");
-            }
-            Ok(Process {
-                pid,
-                ppid,
-                executable: exe.trim().into(),
-                args: Vec::new(),
-            })
-        })
-        .collect()
-}
-fn desktop(p: &Process) -> bool {
-    let Some((_, tail)) = p.executable.split_once("/Claude.app/Contents/") else {
-        return false;
-    };
-    tail == "MacOS/Claude"
-        || (tail.starts_with("Frameworks/")
-            && (matches!(
-                Path::new(tail).file_name().and_then(|s| s.to_str()),
-                Some(
-                    "Claude Helper"
-                        | "Claude Helper (GPU)"
-                        | "Claude Helper (Renderer)"
-                        | "Claude Helper (Plugin)"
-                )
-            ) || tail.ends_with("/chrome_crashpad_handler")))
-}
-fn main_desktop(p: &Process) -> bool {
-    p.executable.ends_with("/Claude.app/Contents/MacOS/Claude")
-}
-fn cli(p: &Process) -> bool {
-    let basename = Path::new(&p.executable)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if basename == "claude" || p.executable.contains("/.local/share/claude/versions/") {
-        return true;
-    }
-    if basename != "node" && basename != "nodejs" {
-        return false;
-    }
+fn node_cli(p: &Process) -> bool {
     // Read native argv boundaries; paths may contain spaces.
     let mut args = p.args.iter().map(String::as_str);
     args.next();
@@ -124,7 +90,13 @@ fn cli(p: &Process) -> bool {
     }
     false
 }
-fn classify(processes: &[Process], self_pid: i32) -> Activity {
+fn classify_with(
+    processes: &[Process],
+    self_pid: i32,
+    desktop: impl Fn(&Process) -> bool,
+    main_desktop: impl Fn(&Process) -> bool,
+    cli: impl Fn(&Process) -> bool,
+) -> Activity {
     let processes: Vec<_> = processes.iter().filter(|p| p.pid != self_pid).collect();
     let mut related: BTreeSet<i32> = processes
         .iter()
@@ -150,10 +122,10 @@ fn classify(processes: &[Process], self_pid: i32) -> Activity {
         } else if related.contains(&p.pid) && !desktop(p) {
             busy.push(format!("Desktop job descendant is running (PID {})", p.pid));
         } else if !desktop(p)
-            && Path::new(&p.executable)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.to_lowercase() != "claudehistory")
+            && p.executable.rsplit(['/', '\\']).next().is_some_and(|s| {
+                !s.eq_ignore_ascii_case("claudehistory")
+                    && !s.eq_ignore_ascii_case("claudehistory.exe")
+            })
             && p.executable.to_lowercase().contains("claude")
         {
             unknown.push(format!("Unrecognized Claude process (PID {})", p.pid));
@@ -175,25 +147,14 @@ fn classify(processes: &[Process], self_pid: i32) -> Activity {
         }
     }
 }
-/// Fixture-only parser entry point, without invoking processes or signals.
+/// Fixture-only macOS process classification without native observation.
 #[doc(hidden)]
 pub fn classify_fixture(
     snapshot: &str,
     arguments: &[(i32, &str)],
     self_pid: u32,
 ) -> Result<Activity> {
-    let mut processes = parse(snapshot)?;
-    for p in &mut processes {
-        p.args = arguments
-            .iter()
-            .find(|(pid, _)| *pid == p.pid)
-            .map(|(_, a)| *a)
-            .unwrap_or("")
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-    }
-    Ok(classify(&processes, self_pid as i32))
+    macos::classify_fixture(snapshot, arguments, self_pid)
 }
 #[doc(hidden)]
 pub fn classify_argv_fixture(
@@ -201,112 +162,14 @@ pub fn classify_argv_fixture(
     arguments: &[(i32, &[&str])],
     self_pid: u32,
 ) -> Result<Activity> {
-    let mut processes = parse(snapshot)?;
-    for p in &mut processes {
-        p.args = arguments
-            .iter()
-            .find(|(pid, _)| *pid == p.pid)
-            .map(|(_, argv)| argv.iter().map(|s| (*s).to_owned()).collect())
-            .unwrap_or_default();
-    }
-    Ok(classify(&processes, self_pid as i32))
+    macos::classify_argv_fixture(snapshot, arguments, self_pid)
 }
 
-fn parse_native_argv(bytes: &[u8]) -> Result<Vec<String>> {
-    let argc = i32::from_ne_bytes(bytes.get(..4).context("missing argv count")?.try_into()?);
-    if !(1..100_000).contains(&argc) {
-        bail!("invalid argv count");
-    }
-    let mut cursor = 4;
-    cursor += bytes[cursor..]
-        .iter()
-        .position(|b| *b == 0)
-        .context("missing executable terminator")?
-        + 1;
-    while bytes.get(cursor) == Some(&0) {
-        cursor += 1;
-    }
-    let mut argv = Vec::new();
-    for _ in 0..argc {
-        let rest = bytes.get(cursor..).context("truncated argv")?;
-        let end = rest
-            .iter()
-            .position(|b| *b == 0)
-            .context("missing argv terminator")?;
-        argv.push(std::str::from_utf8(&rest[..end])?.to_owned());
-        cursor += end + 1;
-    }
-    Ok(argv)
-}
-
-#[cfg(target_os = "macos")]
-fn native_argv(pid: i32) -> Result<Vec<String>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    let mut size = 0;
-    // KERN_PROCARGS2 returns argc, executable path, then NUL-separated argv.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error()).context("argv observation unavailable");
-    }
-    if size == 0 || size > 16 * 1024 * 1024 {
-        bail!("invalid argv buffer size");
-    }
-    let mut bytes = vec![0u8; size];
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error()).context("argv observation failed");
-    }
-    bytes.truncate(size);
-    parse_native_argv(&bytes)
-}
-#[cfg(not(target_os = "macos"))]
-fn native_argv(_pid: i32) -> Result<Vec<String>> {
-    bail!("unsupported platform");
-}
 fn supported() -> Result<()> {
-    if !cfg!(target_os = "macos") {
-        bail!("Activity inspection is supported only on macOS");
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        bail!("Activity inspection is supported only on macOS and Windows");
     }
     Ok(())
-}
-fn snapshot() -> Result<Vec<Process>> {
-    supported()?;
-    let out = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,comm="])
-        .output()
-        .context("cannot observe processes")?;
-    if !out.status.success() {
-        bail!("process observation failed");
-    }
-    let mut processes = parse(std::str::from_utf8(&out.stdout)?)?;
-    for p in &mut processes {
-        let name = Path::new(&p.executable)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if name == "node" || name == "nodejs" {
-            p.args = native_argv(p.pid)?;
-        }
-    }
-    Ok(processes)
 }
 #[derive(Debug, PartialEq, Eq)]
 struct Stamp {
@@ -316,8 +179,8 @@ struct Stamp {
 type Metadata = BTreeMap<PathBuf, Stamp>;
 fn record(path: &Path, out: &mut Metadata) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
-    if m.file_type().is_symlink() {
-        bail!("history contains a symbolic link");
+    if platform::redirected(&m) {
+        bail!("history contains a redirected link");
     }
     if m.is_file() {
         out.insert(
@@ -335,7 +198,7 @@ fn collect_json(path: &Path, extension: &str, depth: usize, out: &mut Metadata) 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
         Ok(m) => {
-            if m.file_type().is_symlink() || !m.is_dir() {
+            if platform::redirected(&m) || !m.is_dir() {
                 bail!("invalid history directory");
             }
         }
@@ -345,11 +208,11 @@ fn collect_json(path: &Path, extension: &str, depth: usize, out: &mut Metadata) 
         .max_depth(depth)
     {
         let entry = entry?;
-        if entry.file_type().is_symlink()
+        if platform::redirected(&fs::symlink_metadata(entry.path())?)
             && (entry.depth() < depth
                 || entry.path().extension().and_then(|s| s.to_str()) == Some(extension))
         {
-            bail!("history contains a symbolic link");
+            bail!("history contains a redirected link");
         }
         if entry.file_type().is_file()
             && entry.path().extension().and_then(|s| s.to_str()) == Some(extension)
@@ -365,7 +228,7 @@ fn reject_symlink_ancestors(path: &Path) -> Result<()> {
             continue;
         }
         match fs::symlink_metadata(ancestor) {
-            Ok(m) if m.file_type().is_symlink() => bail!("history path contains a symbolic link"),
+            Ok(m) if platform::redirected(&m) => bail!("history path contains a redirected link"),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -387,49 +250,6 @@ fn metadata(data_root: &Path, cli_root: &Path) -> Result<Metadata> {
     collect_json(&cli_root.join("projects"), "jsonl", 2, &mut out)?;
     Ok(out)
 }
-fn tcp(pids: &[i32]) -> Result<bool> {
-    let ids = pids
-        .iter()
-        .map(i32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let out = Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-p", &ids, "-iTCP", "-F", "fPnT"])
-        .output()
-        .context("TCP observation unavailable")?;
-    if !out.status.success() {
-        if out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty() {
-            return Ok(false);
-        }
-        bail!("TCP observation failed");
-    }
-    tcp_output(std::str::from_utf8(&out.stdout)?)
-}
-fn tcp_output(s: &str) -> Result<bool> {
-    if s.is_empty() {
-        return Ok(false);
-    }
-    let mut socket = false;
-    let mut listening = false;
-    let mut saw_socket = false;
-    for line in s.lines() {
-        if line.starts_with('f') {
-            if socket && !listening {
-                return Ok(true);
-            }
-            socket = true;
-            listening = false;
-            saw_socket = true;
-        } else if line.starts_with("TST=") {
-            if line != "TST=LISTEN" {
-                return Ok(true);
-            }
-            listening = true;
-        }
-    }
-    Ok(!saw_socket || (socket && !listening))
-}
-
 fn unknown() -> Activity {
     Activity::Unknown {
         reasons: vec!["Activity observation failed; close Claude manually and retry".into()],
@@ -438,15 +258,15 @@ fn unknown() -> Activity {
 pub fn inspect(data_root: &Path, cli_root: &Path) -> Result<Activity> {
     supported()?;
     let result = (|| -> Result<Activity> {
-        let before = snapshot()?;
-        let initial = classify(&before, std::process::id() as i32);
+        let before = platform::snapshot()?;
+        let initial = platform::classify_current(&before, std::process::id() as i32);
         if matches!(initial, Activity::Busy { .. } | Activity::Unknown { .. }) {
             return Ok(initial);
         }
         let files = metadata(data_root, cli_root)?;
         thread::sleep(Duration::from_secs(1));
-        let after = snapshot()?;
-        let final_state = classify(&after, std::process::id() as i32);
+        let after = platform::snapshot()?;
+        let final_state = platform::classify_current(&after, std::process::id() as i32);
         if matches!(
             final_state,
             Activity::Busy { .. } | Activity::Unknown { .. }
@@ -464,7 +284,7 @@ pub fn inspect(data_root: &Path, cli_root: &Path) -> Result<Activity> {
             });
         }
         if let Activity::IdleDesktop { ref pids } = final_state
-            && tcp(pids)?
+            && platform::tcp(pids)?
         {
             return Ok(Activity::Unknown {
                 reasons: vec![
@@ -478,7 +298,9 @@ pub fn inspect(data_root: &Path, cli_root: &Path) -> Result<Activity> {
 }
 pub fn require_stopped() -> Result<()> {
     supported()?;
-    if classify(&snapshot()?, std::process::id() as i32) != Activity::Stopped {
+    if platform::classify_current(&platform::snapshot()?, std::process::id() as i32)
+        != Activity::Stopped
+    {
         bail!("作業中です。作業を終了してから進めてください。（Claude関連プロセスを検知）");
     }
     Ok(())
@@ -492,8 +314,8 @@ pub fn close_idle_desktop(pids: &[i32], data_root: &Path, cli_root: &Path) -> Re
     {
         bail!("Desktop activity changed; close Claude manually");
     }
-    let processes = snapshot()?;
-    if classify(&processes, std::process::id() as i32)
+    let processes = platform::snapshot()?;
+    if platform::classify_current(&processes, std::process::id() as i32)
         != (Activity::IdleDesktop {
             pids: pids.to_vec(),
         })
@@ -502,19 +324,16 @@ pub fn close_idle_desktop(pids: &[i32], data_root: &Path, cli_root: &Path) -> Re
     }
     let mains: Vec<_> = processes
         .iter()
-        .filter(|p| main_desktop(p) && pids.contains(&p.pid))
+        .filter(|p| platform::main_desktop_current(p) && pids.contains(&p.pid))
         .collect();
     if mains.len() != 1 {
         bail!("Cannot identify one Desktop main process");
     }
-    // Signal only the positively identified main app, never helpers or CLI workers.
-    if unsafe { libc::kill(mains[0].pid, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("normal Desktop termination failed");
-    }
+    platform::close(mains[0].pid)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let procs = snapshot()?;
-        let state = classify(&procs, std::process::id() as i32);
+        let procs = platform::snapshot()?;
+        let state = platform::classify_current(&procs, std::process::id() as i32);
         if state == Activity::Stopped && !procs.iter().any(|p| pids.contains(&p.pid)) {
             return Ok(());
         }
@@ -531,28 +350,6 @@ pub fn close_idle_desktop(pids: &[i32], data_root: &Path, cli_root: &Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn native_buffer_preserves_argv_and_ignores_environment() {
-        let mut bytes = 3i32.to_ne_bytes().to_vec();
-        bytes.extend_from_slice(
-            b"/usr/bin/node\0\0node\0--conditions\0path with spaces\0SECRET=not argv\0",
-        );
-        assert_eq!(
-            parse_native_argv(&bytes).unwrap(),
-            vec!["node", "--conditions", "path with spaces"]
-        );
-        assert!(parse_native_argv(&bytes[..10]).is_err());
-        assert!(parse_native_argv(&[]).is_err());
-    }
-    #[test]
-    fn socket_states_fail_closed() {
-        assert!(!tcp_output("").unwrap());
-        assert!(!tcp_output("p10\nf10\nn*:3000\nTST=LISTEN\n").unwrap());
-        assert!(tcp_output("p10\nTST=ESTABLISHED\n").unwrap());
-        assert!(tcp_output("p10\nTST=SYN_SENT\n").unwrap());
-        assert!(tcp_output("unexpected output\n").unwrap());
-        assert!(tcp_output("p10\nf10\nTST=LISTEN\nf11\nPTCP\nnremote\n").unwrap());
-    }
     #[test]
     fn metadata_change_and_symlinks_are_detected() {
         let root = tempfile::tempdir().unwrap();
@@ -577,5 +374,33 @@ mod tests {
                 .unwrap();
             assert!(metadata(&data, &cli).is_err());
         }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn metadata_rejects_windows_junctions_and_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let cli = temp.path().join("cli");
+        let registry = data.join("claude-code-sessions").join("a");
+        let external = temp.path().join("external");
+        fs::create_dir_all(&registry).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("work.json"), "{}").unwrap();
+        let junction = registry.join("linked");
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&external)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "fixture junction creation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(metadata(&data, &cli).is_err());
+        assert!(metadata(&junction.join("nested"), &cli).is_err());
+        fs::remove_dir(&junction).unwrap();
+        assert!(external.join("work.json").is_file());
     }
 }

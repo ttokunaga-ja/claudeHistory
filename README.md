@@ -1,12 +1,14 @@
 # claudeHistory
 
-同じMacでClaude Desktopのアカウントを切り替えた後、Codeのローカル会話履歴を新しいアカウントの一覧へ追加するRust製CLIです。非公式ツールで、Anthropicによる承認・保証はありません。
+同じPCでClaude Desktopのアカウントを切り替えた後、Codeのローカル会話履歴を新しいアカウントの一覧へ追加するRust製CLIです。非公式ツールで、Anthropicによる承認・保証はありません。
 
-初版はmacOS専用です。通常チャット、Cowork、クラウド会話の移行、自動ログアウト・ログインには対応しません。履歴はローカルで処理し、認証情報や会話を外部へ送信しません。復元した会話で後からメッセージを送信すると、その会話の文脈はログイン中のアカウントでClaudeに送信されます。自分が所有し、移行してよいアカウント間だけで使用してください。
+macOS（Apple Silicon）とWindows（x64）に対応しています。通常チャット、Cowork、クラウド会話の移行、自動ログアウト・ログインには対応しません。履歴はローカルで処理し、認証情報や会話を外部へ送信しません。復元した会話で後からメッセージを送信すると、その会話の文脈はログイン中のアカウントでClaudeに送信されます。自分が所有し、移行してよいアカウント間だけで使用してください。
 
-## 使い方
+## インストール
 
-アカウント切り替え後に実行します。[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-macos-arm64.tar.gz`をダウンロードして展開し、同梱の`install.sh`を実行してください。配布版はApple Silicon向けです。
+### macOS
+
+[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-macos-arm64.tar.gz`をダウンロードして展開し、同梱の`install.sh`を実行してください。配布版はApple Silicon向けです。
 
 ```sh
 tar -xzf claudeHistory-macos-arm64.tar.gz
@@ -14,6 +16,22 @@ sh claudeHistory-macos-arm64/install.sh
 ```
 
 `~/.local/bin/claudeHistory`へインストールします。SHA-256と版の検証に失敗した場合は既存の実行ファイルを置き換えません。`~/.local/bin`をPATHに追加してから利用してください。
+
+### Windows
+
+[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)から`claudeHistory-windows-x64.zip`をダウンロードします。PowerShellでダウンロード先を開いて実行してください。
+
+```powershell
+Expand-Archive .\claudeHistory-windows-x64.zip -DestinationPath .\claudeHistory-package
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\claudeHistory-package\claudeHistory-windows-x64\install.ps1
+& "$env:USERPROFILE\.local\bin\claudeHistory.exe" --version
+```
+
+`%USERPROFILE%\.local\bin`にインストールします。上の`-ExecutionPolicy Bypass`はこのインストール用プロセスだけに適用され、Windows全体の設定は変更しません。SHA-256と版を検証してから既存の実行ファイルを置き換えます。Windowsの「環境変数」で、このフォルダーをユーザーのPATHに追加してターミナルを開き直すと、以下のコマンドをそのまま使えます。
+
+## 使い方
+
+Desktopでアカウントを切り替えた後に実行します。以下は両OS共通です。
 
 ```sh
 claudeHistory accounts
@@ -48,7 +66,7 @@ claudeHistory undo /absolute/path/to/backup
 
 ## 保存形式と検証の限界
 
-対象は`~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_*.json`です。移すのは登録情報で、同じPC上の会話本文への参照を維持します。本文そのものがなくなった会話を復旧する機能ではありません。Desktop内部形式に依存するため、アプリ更新後は`--dry-run`と画面で確認してください。件数だけで全会話が続行可能とは判断できません。
+DesktopデータフォルダーはmacOSで`~/Library/Application Support/Claude`、Windowsで`%APPDATA%\Claude`です。対象はその配下の`claude-code-sessions/<account>/<org>/local_*.json`です。保存先が異なる場合は`--data-dir`で明示します。移すのは登録情報で、同じPC上の会話本文への参照を維持します。本文そのものがなくなった会話を復旧する機能ではありません。Desktop内部形式に依存するため、アプリ更新後は`--dry-run`と画面で確認してください。件数だけで全会話が続行可能とは判断できません。
 
 現在のアカウント候補は`config.json`の`lastKnownAccountUuid`から取得します。これは認証状態の証明ではありません。移行先組織が未作成なら、このツールでIDを推測して作成せず、Desktopにログインし直して保存状態を確認してください。
 
@@ -69,10 +87,24 @@ sh scripts/package.sh
 sh tests/install.sh
 ```
 
-パッケージ内の`install.sh`を実行すると、SHA-256と実行ファイルの版を検証してから`~/.local/bin/claudeHistory`にインストールします。現在のMac向けのバイナリです。Apple SiliconとIntelの両方に配布するには、それぞれビルドと実機検証が必要です。
+パッケージ内の`install.sh`を実行すると、SHA-256と実行ファイルの版を検証してから`~/.local/bin/claudeHistory`にインストールします。macOSで実行した場合は現在のMac向けのバイナリです。Apple SiliconとIntelの両方に配布するには、それぞれビルドと実機検証が必要です。
 
 ```sh
 sh /path/to/extracted-package/install.sh
 ```
 
-署名・公証、Intel実機検証、Windows対応は未実施です。`SPEC.md`が初版の要件と受入範囲です。
+Windowsでの開発・配布にはx64 MSVC Rust toolchainとVisual Studio C++ Build Toolsを使用します。MSVC版はCRTを静的リンクします。
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc fmt --check
+cargo +stable-x86_64-pc-windows-msvc clippy --all-targets --locked -- -D warnings
+cargo +stable-x86_64-pc-windows-msvc test --locked
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\install.ps1
+```
+
+共通処理は`history.rs`と`runtime.rs`、OS依存のファイル操作は`history_platform.rs`、実行状態の取得と終了要求は`runtime/macos.rs`・`runtime/windows.rs`、標準保存先は`platform.rs`に分離しています。
+
+Windowsの終了要求はウィンドウの正常終了メッセージを使用します。SSHなどでウィンドウにアクセスできない場合は中止するため、Desktopを手動終了してください。バックアップの権限は現在のWindowsユーザーだけに制限します。WindowsではUnixのdirectory fsyncと同じ保証を提供できず、ファイルのflushとwrite-through renameを使用し、その制約を復旧記録に残します。
+
+署名・公証、Intel Mac実機検証は未実施です。Windows実機のfixture検証と、実際のDesktop画面での会話続行は区別しています。確認済みの範囲は[VALIDATION.md](VALIDATION.md)、要件は[SPEC.md](SPEC.md)を参照してください。

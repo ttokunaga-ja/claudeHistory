@@ -1,10 +1,20 @@
-# 初版の検証
+# v0.2.0の検証
 
-- Rust fixtureテスト22件成功。重複回避、既存履歴保持、競合、権限除去、バックアップ、途中失敗の復旧記録、undoの変更検出、シンボリックリンク、排他、作業の再開、Yes/No/EOF、TCP観測、Node argvの空白を含むパスを検証。
-- `cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、`cargo build --release --locked`成功。
-- `sh tests/install.sh`で正常インストール、破損チェックサム、重複チェックサムの拒否と既存バイナリ保持を検証。インストール先は破棄可能なfixtureフォルダー。
-- このMacの実行ファイルで`status`と`transfer --dry-run`を実行。実際のClaude CLIとDesktop子プロセスを検知し、作業中メッセージを確認。実データの書き込みとプロセス終了は実行していない。
-- 実際のDesktopをYes選択で終了する操作と、生成した初版による実会話の続行は未検証。過去の手動復旧とfixture成功を初版の実機受入と同一視しない。
-- 配布物はmacOS Apple Silicon向けのパッケージ。Intel実機、Windows、署名・公証は未実施。公開ReleaseはGitHub Actionsを使わず、ローカル検証済みの成果物をアップロードする。
+2026-10-07にmacOS Apple Siliconと、SSH接続したWindows x64実機で検証。WindowsはRust 1.97.1 / x86_64-pc-windows-msvcとVisual Studio C++ Build Toolsを使用。
 
-機械的な検出に完全性はない。CLI対話待ち、Desktopの待機TCP接続も保守的に中止する。安全な終了を判定できない場合は、ユーザーが作業を終え、Desktop・CLIを手動終了してから実行する。
+- macOS 30件、Windows 33件のRustテストが成功。
+- 両OSで`cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、`cargo build --release --locked`を実行。WindowsではMSVC toolchainを明示する。
+- 共通fixtureで不足分追加、重複回避、既存保持、競合、権限除去、バックアップ、途中失敗と復旧記録、undoの変更検出、作業再開時の中止、別プロセスとの排他を検証。
+- Windows固有のfixtureでジャンクション・祖先reparse point拒否、バックアップの現在ユーザーSIDだけのDACL、実際のCIMプロセス取得・TCPテーブル取得を検証。
+- Windowsの正常終了要求は、所有するテスト用ウィンドウにWM_CLOSEを送り通常のメッセージ処理で閉じることを検証。別PIDのウィンドウや操作できないウィンドウは拒否。SSHセッションで通常のDesktopウィンドウが取得できることの証明ではない。
+- 両OSのインストーラーを破棄可能なフォルダーで実行。正常インストール、既存版の置換、破損・重複チェックサムの拒否と既存実行ファイル保持を確認。Windowsでは正しいチェックサムでも版が異なる実行ファイルを拒否することも確認。
+
+## 実データとの境界
+
+このMacでは実際のClaude CLI・Desktop作業用子プロセスをread-onlyで検知する。実データへの書き込みや実アプリの終了は実行しない。
+
+Windows検証機の標準保存先にはClaude Desktopの登録データがない。MSIX版Claudeの常駐`cowork-svc.exe`は起動中で、実行ファイルの`status`は安全に作業を判定できないものとして中止を表示する。この実サービスは停止しない。独立したfixture登録で配布実行ファイルの`accounts`・`status`・`transfer --dry-run`を確認し、独立した模擬CLIプロセスの起動中に引き継ぎが中止されることを確認する。引き継ぎ・undoのファイル操作はネイティブの共通fixtureテストで検証する。実際のDesktopの画面で全会話を続行する受入は未実施。
+
+機械的な検出に完全性はない。観測後に作業が再開する競合や、他のプログラムがファイルを差し替える競合は残る。CLI対話待ち、Desktopの待機TCP接続も保守的に中止する。判定できない場合は作業を終え、Desktop・CLIを手動終了してから実行する。
+
+配布はmacOS Apple SiliconとWindows x64。Intel Mac実機、署名・公証は未実施。GitHub Actionsは使わず、両実機で検証したパッケージとSHA256SUMSをReleaseへアップロードする。
