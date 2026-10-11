@@ -10,6 +10,8 @@ struct Row {
     path: Option<String>,
     name: String,
     command: Option<String>,
+    #[serde(default)]
+    started: String,
 }
 fn parse(snapshot: &str) -> Result<Vec<Process>> {
     let rows: Vec<Row> = serde_json::from_str(snapshot)?;
@@ -34,6 +36,7 @@ fn parse(snapshot: &str) -> Result<Vec<Process>> {
                 ppid: row.ppid,
                 executable,
                 args,
+                started: row.started,
             })
         })
         .collect()
@@ -243,7 +246,7 @@ fn powershell(script: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 pub(super) fn snapshot() -> Result<Vec<Process>> {
     let json = powershell(
-        r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $rows=@(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -gt 0 } | ForEach-Object { @{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;path=$_.ExecutablePath;name=$_.Name;command=$_.CommandLine} }); ConvertTo-Json -InputObject $rows -Compress -Depth 3"#,
+        r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $rows=@(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -gt 0 } | ForEach-Object { @{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;path=$_.ExecutablePath;name=$_.Name;command=$_.CommandLine;started=$_.CreationDate.ToUniversalTime().Ticks.ToString()} }); ConvertTo-Json -InputObject $rows -Compress -Depth 3"#,
     )?;
     parse(&json)
 }
@@ -253,6 +256,97 @@ pub(super) fn tcp(pids: &[i32]) -> Result<bool> {
         r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $rows=@(Get-NetTCPConnection | ForEach-Object { @{pid=[int]$_.OwningProcess;state=$_.State.ToString()} }); ConvertTo-Json -InputObject $rows -Compress -Depth 3"#,
     )?;
     tcp_output(&json, pids)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn known_current(p: &Process) -> bool {
+    std::env::var("LOCALAPPDATA").is_ok_and(|root| {
+        if desktop(p, &root) {
+            return true;
+        }
+        if !cli(p, &root) {
+            return false;
+        }
+        if !matches!(basename(&p.executable).as_str(), "node.exe" | "nodejs.exe") {
+            return true;
+        }
+        let mut normalized = p.clone();
+        normalized.args = p.args.iter().map(|a| a.replace('\\', "/")).collect();
+        super::node_cli_owned(&normalized)
+    })
+}
+#[cfg(target_os = "windows")]
+pub(super) fn terminate(process: &Process, force: bool) -> Result<()> {
+    let pid = process.pid;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+    };
+    if pid <= 0 {
+        bail!("Invalid termination target");
+    }
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE
+                | windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid as u32,
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut creation = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let observed = unsafe {
+        windows_sys::Win32::System::Threading::GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    // .NET DateTime ticks begin at year 1; FILETIME begins at 1601.
+    let birth = (ticks + 504911232000000000).to_string();
+    if observed == 0 || birth != process.started {
+        unsafe {
+            CloseHandle(handle);
+        }
+        bail!("Termination target creation time changed");
+    }
+    // Retain the verified process handle until WM_CLOSE dispatch completes, so
+    // its process object/PID cannot be replaced during window enumeration.
+    let result = (|| -> Result<()> {
+        if !force {
+            // CLI/worker processes have no general graceful termination mechanism.
+            // They get the bounded grace period before confirmed force termination.
+            let processes = snapshot()?;
+            if let Some(current) = processes.iter().find(|p| p.pid == pid) {
+                if current.started != process.started || current.executable != process.executable {
+                    bail!("Graceful termination target identity changed");
+                }
+                if main_desktop_current(current) {
+                    close(pid)?;
+                }
+            }
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(handle, 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -308,7 +402,7 @@ fn post_close(window: *mut std::ffi::c_void, pid: i32) -> Result<()> {
             lparam: isize,
         ) -> i32;
     }
-    // Recheck HWND ownership immediately before WM_CLOSE. Never TerminateProcess.
+    // Recheck HWND ownership immediately before WM_CLOSE.
     let mut owner = 0;
     if pid <= 0
         || unsafe { GetWindowThreadProcessId(window, &mut owner) } == 0

@@ -66,3 +66,11 @@ CLIで1番から登録画面なしに進むこと、壊れた旧設定ファイ�
 公開リポジトリでも未認証GitHub APIの回数制限で403となることを実機で再現。releases/latestのAPIアクセスを廃止し、公開リリースページのHEADリダイレクトから版を判定する。最終URLは公式リポジトリのreleases/tag/vX.Y.Zだけ受け付け、クエリ・フラグメント・不正な版・別ホストや別リポジトリを拒否。認証トークンやAPIへのフォールバックは追加しない。
 
 macOS 71件、Windows x64 MSVC 76件のRustテスト、fmt、strict Clippy、release build、両インストーラーが成功。不正な転送先や取得失敗で既存本体が変わらないことを確認。両OSで実際の公開ページを使ってupdateを実行し、GitHub APIなしで正常終了することを確認した。チェックサム・候補の版・実行中本体の変更検知と失敗時復元は維持する。
+
+## 2026-10-11 全Claudeプロセスの終了確認
+
+起動中の既知のClaude Desktop・CLI・ヘルパーとその子プロセスを全対象のPID付き確認へ統合し、旧Desktop待機時だけの終了経路を置き換えた。対話TTYのYes/yのみ許可し、否定・Enter・EOF・非TTYでは終了要求を行わない。未知の対象、CLI所有者を確定できないNode引数、欠落・循環する呼出し元祖先、再利用PID、新規対象、親終了後の既知の子プロセスから生まれた新規子も中止する。
+
+Rust 1.99.0でmacOSの83件のテスト、fmt、strict Clippy、release build、隔離先を使う両shellインストーラーテストが成功。正常終了から残存対象だけの強制終了、各要求前の再確認、終了待ちの失敗をモックで検証した。macOSでは現在のテストプロセスのネイティブ開始時刻とsnapshotもread-onlyで確認。Windows x64 MSVCは全targetのcross-checkが成功し、Windows用APIと型を確認した。Windowsネイティブ実行、実Claudeへの終了要求・強制終了、実履歴への書き込みは今回実行していない。
+
+ネイティブCLIの終了対象は正確なmajor.minor.patchのバージョンファイルに限定し、versions配下のworker・backupは保守的に作業を遮断しても終了所有者とは認めない。macOSのps状態でZと明示されたゾンビだけを実行終了と扱い、通常終了した隔離子プロセスを親が回収する前の状態でsnapshotから除外されることを実機テストした。実Claudeへの終了要求は行っていない。

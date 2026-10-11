@@ -26,6 +26,7 @@ pub(super) fn parse(snapshot: &str) -> Result<Vec<Process>> {
                 ppid,
                 executable: exe.trim().into(),
                 args: Vec::new(),
+                started: String::new(),
             })
         })
         .collect()
@@ -62,6 +63,49 @@ fn cli(p: &Process) -> bool {
         return false;
     }
     super::node_cli(p)
+}
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn native_cli_owned(p: &Process) -> bool {
+    let name = Path::new(&p.executable)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if name == "claude" {
+        return true;
+    }
+    if let Some((_, version)) = p.executable.rsplit_once("/.local/share/claude/versions/") {
+        let parts: Vec<_> = version.split('.').collect();
+        return parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    }
+    matches!(name, "node" | "nodejs") && super::node_cli_owned(p)
+}
+#[cfg(any(not(target_os = "windows"), test))]
+fn parse_native_snapshot(snapshot: &str) -> Result<Vec<Process>> {
+    let mut live = Vec::new();
+    for row in snapshot.lines().filter(|row| !row.trim().is_empty()) {
+        let (pid, rest) = row
+            .trim()
+            .split_once(char::is_whitespace)
+            .context("invalid native process snapshot")?;
+        let (ppid, rest) = rest
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .context("invalid native process snapshot")?;
+        let (state, executable) = rest
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .context("missing native process state")?;
+        let process = parse(&format!("{pid} {ppid} {}", executable.trim_start()))?.remove(0);
+        // Native ps STAT=Z is positive proof that this process cannot execute or write.
+        // Its command name can already be <defunct>; never signal it or treat that as a replacement.
+        if !state.starts_with('Z') {
+            live.push(process);
+        }
+    }
+    Ok(live)
 }
 /// Fixture-only parser entry point, without invoking processes or signals.
 #[doc(hidden)]
@@ -182,18 +226,56 @@ fn native_argv(pid: i32) -> Result<Vec<String>> {
 fn native_argv(_pid: i32) -> Result<Vec<String>> {
     bail!("unsupported platform");
 }
+#[cfg(target_os = "macos")]
+fn process_started(pid: i32) -> Result<String> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct BsdInfo {
+        fields: [u32; 12],
+        comm: [u8; 16],
+        name: [u8; 32],
+        trailing: [u32; 6],
+        start_seconds: u64,
+        start_microseconds: u64,
+    }
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut std::ffi::c_void,
+            size: i32,
+        ) -> i32;
+    }
+    let mut info = BsdInfo::default();
+    let size = std::mem::size_of::<BsdInfo>() as i32;
+    if unsafe { proc_pidinfo(pid, 3, 0, (&mut info as *mut BsdInfo).cast(), size) } != size {
+        bail!("Process creation time observation unavailable");
+    }
+    Ok(format!(
+        "{}:{}",
+        info.start_seconds, info.start_microseconds
+    ))
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn process_started(_pid: i32) -> Result<String> {
+    bail!("unsupported platform")
+}
 #[cfg(not(target_os = "windows"))]
 pub(super) fn snapshot() -> Result<Vec<Process>> {
     super::supported()?;
     let out = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,comm="])
+        .args(["-axo", "pid=,ppid=,stat=,comm="])
         .output()
         .context("cannot observe processes")?;
     if !out.status.success() {
         bail!("process observation failed");
     }
-    let mut processes = parse(std::str::from_utf8(&out.stdout)?)?;
+    let mut processes = parse_native_snapshot(std::str::from_utf8(&out.stdout)?)?;
     for p in &mut processes {
+        // Unrelated short-lived/system processes may disappear or be inaccessible.
+        // Every selected target must have a readable birth identity (checked by the core).
+        p.started = process_started(p.pid).unwrap_or_default();
         let name = Path::new(&p.executable)
             .file_name()
             .and_then(|s| s.to_str())
@@ -254,20 +336,32 @@ pub(super) fn classify_current(processes: &[Process], self_pid: i32) -> Activity
     classify_with(processes, self_pid, desktop, main_desktop_current, cli)
 }
 #[cfg(not(target_os = "windows"))]
-pub(super) fn close(pid: i32) -> Result<()> {
+pub(super) fn terminate(process: &Process, force: bool) -> Result<()> {
+    let pid = process.pid;
     #[cfg(target_os = "macos")]
     {
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("normal Desktop termination failed");
+        if process.started.is_empty() || process_started(pid)? != process.started {
+            bail!("Termination target creation time changed");
+        }
+        if unsafe { libc::kill(pid, if force { libc::SIGKILL } else { libc::SIGTERM }) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error).context("Claude termination request failed");
         }
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = pid;
+        let _ = (pid, force);
         bail!("unsupported platform")
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(super) fn known_current(p: &Process) -> bool {
+    desktop(p) || native_cli_owned(p)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -278,6 +372,76 @@ pub(super) fn redirected(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_cli_ownership_accepts_only_exact_version_leaf() {
+        for (path, owned) in [
+            ("/Users/me/.local/share/claude/versions/2.1.296", true),
+            (
+                "/Users/me/.local/share/claude/versions/2.1.296/worker",
+                false,
+            ),
+            ("/Users/me/.local/share/claude/versions/backup", false),
+            (
+                "/Users/me/.local/share/claude/versions/2.1.296-backup",
+                false,
+            ),
+        ] {
+            let process = parse(&format!("10 1 {path}")).unwrap().remove(0);
+            assert_eq!(native_cli_owned(&process), owned);
+            assert!(cli(&process)); // Uncertain version paths remain conservative blockers.
+        }
+    }
+    #[test]
+    fn native_snapshot_filters_only_positively_observed_zombies() {
+        let processes =
+            parse_native_snapshot("10 1 Z <defunct>\n11 1 S <defunct>\n12 1 R /bin/zsh\n").unwrap();
+        assert_eq!(
+            processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_exited_unreaped_child_is_not_a_live_target() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let observed = (|| -> Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let output = std::process::Command::new("/bin/ps")
+                    .args(["-p", &pid.to_string(), "-o", "stat="])
+                    .output()?;
+                if String::from_utf8(output.stdout)?.trim().starts_with('Z') {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("Fixture did not become an observed zombie");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!snapshot()?.iter().any(|p| p.pid == pid));
+            Ok(())
+        })();
+        child.wait().unwrap();
+        observed.unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_creation_identity_is_stable_and_nonempty() {
+        let pid = std::process::id() as i32;
+        let first = process_started(pid).unwrap();
+        assert!(!first.is_empty());
+        assert_ne!(first, "0:0");
+        assert_eq!(first, process_started(pid).unwrap());
+        let processes = snapshot().unwrap();
+        assert_eq!(
+            processes.iter().find(|p| p.pid == pid).unwrap().started,
+            first
+        );
+    }
     #[test]
     fn native_buffer_preserves_argv_and_ignores_environment() {
         let mut bytes = 3i32.to_ne_bytes().to_vec();

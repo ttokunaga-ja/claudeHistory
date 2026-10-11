@@ -38,14 +38,21 @@ pub enum Activity {
     Busy { reasons: Vec<String> },
     Unknown { reasons: Vec<String> },
 }
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Process {
     pid: i32,
     ppid: i32,
     executable: String,
     args: Vec<String>,
+    started: String,
 }
 fn node_cli(p: &Process) -> bool {
+    node_cli_with(p, true)
+}
+fn node_cli_owned(p: &Process) -> bool {
+    node_cli_with(p, false)
+}
+fn node_cli_with(p: &Process, conservative: bool) -> bool {
     // Read native argv boundaries; paths may contain spaces.
     let mut args = p.args.iter().map(String::as_str);
     args.next();
@@ -81,7 +88,8 @@ fn node_cli(p: &Process) -> bool {
         // Unknown separate option operands cannot establish that the later Claude
         // script is only prompt text. Conservatively block in that case.
         return matches
-            || (!script.ends_with(".js")
+            || (conservative
+                && !script.ends_with(".js")
                 && !script.ends_with(".mjs")
                 && !script.ends_with(".cjs")
                 && p.args
@@ -100,7 +108,7 @@ fn classify_with(
     let processes: Vec<_> = processes.iter().filter(|p| p.pid != self_pid).collect();
     let mut related: BTreeSet<i32> = processes
         .iter()
-        .filter(|p| desktop(p))
+        .filter(|p| desktop(p) || cli(p))
         .map(|p| p.pid)
         .collect();
     loop {
@@ -120,7 +128,7 @@ fn classify_with(
         if cli(p) {
             busy.push(format!("Claude CLI is running (PID {})", p.pid));
         } else if related.contains(&p.pid) && !desktop(p) {
-            busy.push(format!("Desktop job descendant is running (PID {})", p.pid));
+            busy.push(format!("Claude job descendant is running (PID {})", p.pid));
         } else if !desktop(p)
             && p.executable.rsplit(['/', '\\']).next().is_some_and(|s| {
                 !s.eq_ignore_ascii_case("claudehistory")
@@ -305,51 +313,392 @@ pub fn require_stopped() -> Result<()> {
     }
     Ok(())
 }
-pub fn close_idle_desktop(pids: &[i32], data_root: &Path, cli_root: &Path) -> Result<()> {
-    supported()?;
-    if inspect(data_root, cli_root)?
-        != (Activity::IdleDesktop {
-            pids: pids.to_vec(),
-        })
-    {
-        bail!("Desktop activity changed; close Claude manually");
+/// A fresh, provider-scoped set of processes. Arguments stay private.
+#[derive(Debug)]
+pub struct ShutdownPlan {
+    processes: Vec<Process>,
+}
+impl ShutdownPlan {
+    pub fn pids(&self) -> Vec<i32> {
+        self.processes.iter().map(|p| p.pid).collect()
     }
-    let processes = platform::snapshot()?;
-    if platform::classify_current(&processes, std::process::id() as i32)
-        != (Activity::IdleDesktop {
-            pids: pids.to_vec(),
-        })
-    {
-        bail!("Desktop process identity changed");
+}
+fn targets_with(
+    processes: &[Process],
+    self_pid: i32,
+    known: impl Fn(&Process) -> bool,
+) -> Result<Vec<Process>> {
+    let unique: BTreeSet<_> = processes.iter().map(|p| p.pid).collect();
+    if unique.len() != processes.len() {
+        bail!("Duplicate process identities; no termination requests sent");
     }
-    let mains: Vec<_> = processes
-        .iter()
-        .filter(|p| platform::main_desktop_current(p) && pids.contains(&p.pid))
-        .collect();
-    if mains.len() != 1 {
-        bail!("Cannot identify one Desktop main process");
-    }
-    platform::close(mains[0].pid)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut protected = BTreeSet::from([self_pid]);
+    let mut cursor = self_pid;
     loop {
-        let procs = platform::snapshot()?;
-        let state = platform::classify_current(&procs, std::process::id() as i32);
-        if state == Activity::Stopped && !procs.iter().any(|p| pids.contains(&p.pid)) {
-            return Ok(());
+        let Some(p) = processes.iter().find(|p| p.pid == cursor) else {
+            bail!("Caller ancestry observation incomplete; run from an independent terminal");
+        };
+        if p.ppid == 0 {
+            break;
         }
-        if matches!(state, Activity::Busy { .. }) {
-            bail!("Claude work appeared during shutdown; no further signals were sent");
+        if !protected.insert(p.ppid) {
+            bail!("Caller ancestry cycle; no termination requests sent");
         }
-        if Instant::now() >= deadline {
-            bail!("Desktop did not exit normally; close it manually");
-        }
-        thread::sleep(Duration::from_millis(200));
+        cursor = p.ppid;
     }
+    let mut related: BTreeSet<_> = processes
+        .iter()
+        .filter(|p| known(p))
+        .map(|p| p.pid)
+        .collect();
+    loop {
+        let before = related.len();
+        for p in processes {
+            if related.contains(&p.ppid) {
+                related.insert(p.pid);
+            }
+        }
+        if related.len() == before {
+            break;
+        }
+    }
+    if !related.is_disjoint(&protected) {
+        bail!(
+            "Claude is this command's caller or ancestor; run from an independent terminal. No processes were terminated."
+        );
+    }
+    Ok(processes
+        .iter()
+        .filter(|p| related.contains(&p.pid))
+        .cloned()
+        .collect())
+}
+fn target_processes(processes: &[Process]) -> Result<Vec<Process>> {
+    if processes.iter().any(|p| {
+        let name = p
+            .executable
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        name != "claudehistory"
+            && name != "claudehistory.exe"
+            && p.executable.to_ascii_lowercase().contains("claude")
+            && !platform::known_current(p)
+    }) {
+        bail!("Unrecognized Claude process; close it manually and retry");
+    }
+    if processes.iter().any(|p| {
+        !platform::known_current(p)
+            && matches!(
+                platform::classify_current(std::slice::from_ref(p), std::process::id() as i32),
+                Activity::Busy { .. }
+            )
+    }) {
+        bail!("Uncertain Claude CLI ownership; close it manually and retry");
+    }
+    let targets = targets_with(
+        processes,
+        std::process::id() as i32,
+        platform::known_current,
+    )?;
+    if targets.iter().any(|p| p.started.is_empty()) {
+        bail!("Claude process creation identity unavailable");
+    }
+    Ok(targets)
+}
+pub fn shutdown_plan(activity: &Activity) -> Result<ShutdownPlan> {
+    supported()?;
+    if let Activity::Unknown { reasons } = activity
+        && reasons.iter().any(|r| {
+            r != "Desktop helpers exist without the main app"
+                && r != "Desktop has TCP connections; activity cannot be distinguished"
+        })
+    {
+        bail!("Activity observation failed or changed; close Claude manually and retry");
+    }
+    let processes = target_processes(&platform::snapshot()?)?;
+    if *activity == Activity::Stopped && !processes.is_empty() {
+        bail!("Claude started after observation; retry");
+    }
+    Ok(ShutdownPlan { processes })
+}
+fn remaining_targets(
+    original: &[Process],
+    snapshot: &[Process],
+    targets: &[Process],
+) -> Result<Vec<Process>> {
+    for current in snapshot
+        .iter()
+        .filter(|p| original.iter().any(|o| o.pid == p.pid))
+    {
+        if !original.iter().any(|o| {
+            o.pid == current.pid
+                && o.executable == current.executable
+                && o.started == current.started
+        }) {
+            bail!("Claude process identity changed; no further termination requests sent");
+        }
+    }
+    let mut related: BTreeSet<_> = targets
+        .iter()
+        .map(|p| p.pid)
+        .chain(
+            snapshot
+                .iter()
+                .filter(|p| original.iter().any(|o| o.pid == p.pid))
+                .map(|p| p.pid),
+        )
+        .collect();
+    loop {
+        let before = related.len();
+        for p in snapshot {
+            if related.contains(&p.ppid) {
+                related.insert(p.pid);
+            }
+        }
+        if related.len() == before {
+            break;
+        }
+    }
+    if related
+        .iter()
+        .any(|pid| !original.iter().any(|o| o.pid == *pid))
+    {
+        bail!("New Claude process appeared; no further termination requests sent");
+    }
+    // Include confirmed descendants even when their parents have exited and they are reparented.
+    Ok(snapshot
+        .iter()
+        .filter(|p| original.iter().any(|o| o.pid == p.pid))
+        .cloned()
+        .collect())
+}
+fn recheck(plan: &ShutdownPlan) -> Result<Vec<Process>> {
+    let snapshot = platform::snapshot()?;
+    let targets = target_processes(&snapshot)?;
+    remaining_targets(&plan.processes, &snapshot, &targets)
+}
+fn stop_with(
+    mut observe: impl FnMut() -> Result<Vec<Process>>,
+    mut terminate: impl FnMut(&Process, bool) -> Result<()>,
+    grace: Duration,
+) -> Result<()> {
+    for force in [false, true] {
+        let remaining = observe()?;
+        for process in remaining.iter().rev() {
+            let current = observe()?;
+            if current.iter().any(|p| p.pid == process.pid) {
+                terminate(process, force)?;
+            }
+        }
+        let deadline = Instant::now() + grace;
+        loop {
+            if observe()?.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    bail!("Confirmed Claude processes did not exit; no history changed")
+}
+pub fn close_confirmed(plan: &ShutdownPlan, data_root: &Path, cli_root: &Path) -> Result<()> {
+    supported()?;
+    // Never add targets after confirmation. Recheck before each request, including force.
+    stop_with(
+        || recheck(plan),
+        platform::terminate,
+        Duration::from_secs(5),
+    )?;
+    if inspect(data_root, cli_root)? != Activity::Stopped {
+        bail!("Claude or history activity appeared after shutdown; no history changed");
+    }
+    require_stopped()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_process(pid: i32, ppid: i32, executable: &str) -> Process {
+        Process {
+            pid,
+            ppid,
+            executable: executable.into(),
+            args: vec![],
+            started: "birth".into(),
+        }
+    }
+    #[test]
+    fn graceful_then_force_covers_all_confirmed_survivors() {
+        use std::cell::RefCell;
+        let alive = RefCell::new(vec![
+            fixture_process(10, 1, "cli"),
+            fixture_process(11, 10, "worker"),
+        ]);
+        let signals = RefCell::new(Vec::new());
+        stop_with(
+            || Ok(alive.borrow().clone()),
+            |p, force| {
+                signals.borrow_mut().push((p.pid, force));
+                if force {
+                    alive.borrow_mut().retain(|a| a.pid != p.pid);
+                }
+                Ok(())
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            *signals.borrow(),
+            vec![(11, false), (10, false), (11, true), (10, true)]
+        );
+    }
+    #[test]
+    fn termination_rechecks_before_each_signal_and_aborts_on_change() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let signals = Cell::new(0);
+        let result = stop_with(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    bail!("new target appeared");
+                }
+                Ok(vec![
+                    fixture_process(10, 1, "cli"),
+                    fixture_process(11, 10, "worker"),
+                ])
+            },
+            |_, _| {
+                signals.set(signals.get() + 1);
+                Ok(())
+            },
+            Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert_eq!(signals.get(), 1);
+    }
+    #[test]
+    fn graceful_exit_never_uses_force_and_timeout_never_succeeds() {
+        use std::cell::Cell;
+        let alive = Cell::new(true);
+        stop_with(
+            || {
+                Ok(if alive.get() {
+                    vec![fixture_process(10, 1, "cli")]
+                } else {
+                    vec![]
+                })
+            },
+            |_, force| {
+                assert!(!force);
+                alive.set(false);
+                Ok(())
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(
+            stop_with(
+                || Ok(vec![fixture_process(10, 1, "cli")]),
+                |_, _| Ok(()),
+                Duration::ZERO
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn ambiguous_node_operand_blocks_but_never_grants_termination_ownership() {
+        let mut process = fixture_process(10, 1, "/usr/bin/node");
+        process.args = vec![
+            "node".into(),
+            "/tmp/worker".into(),
+            "/tmp/@anthropic-ai/claude-code/cli.js".into(),
+        ];
+        assert!(node_cli(&process));
+        assert!(!node_cli_owned(&process));
+        process.args = vec![
+            "node".into(),
+            "/tmp/@anthropic-ai/claude-code/cli.js".into(),
+        ];
+        assert!(node_cli_owned(&process));
+    }
+    #[test]
+    fn incomplete_duplicate_and_cyclic_caller_ancestry_fail_closed() {
+        for processes in [
+            vec![fixture_process(10, 0, "cli")],
+            vec![
+                fixture_process(99, 98, "claudeHistory"),
+                fixture_process(10, 0, "cli"),
+            ],
+            vec![
+                fixture_process(99, 98, "claudeHistory"),
+                fixture_process(98, 99, "shell"),
+            ],
+            vec![
+                fixture_process(99, 0, "claudeHistory"),
+                fixture_process(99, 0, "shell"),
+            ],
+        ] {
+            assert!(targets_with(&processes, 99, |p| p.executable == "cli").is_err());
+        }
+    }
+    #[test]
+    fn shutdown_targets_include_all_claude_trees_and_only_that_provider() {
+        let procs = vec![
+            fixture_process(1, 0, "init"),
+            fixture_process(10, 1, "desktop"),
+            fixture_process(11, 10, "helper"),
+            fixture_process(12, 11, "python"),
+            fixture_process(20, 1, "cli"),
+            fixture_process(21, 20, "mcp"),
+            fixture_process(30, 1, "codex"),
+            fixture_process(31, 30, "node"),
+            fixture_process(99, 1, "claudeHistory"),
+        ];
+        let targets = targets_with(&procs, 99, |p| {
+            matches!(p.executable.as_str(), "desktop" | "helper" | "cli")
+        })
+        .unwrap();
+        assert_eq!(
+            targets.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![10, 11, 12, 20, 21]
+        );
+        let mut inside = procs.clone();
+        inside.last_mut().unwrap().ppid = 21;
+        assert!(
+            targets_with(&inside, 99, |p| p.executable == "cli")
+                .unwrap_err()
+                .to_string()
+                .contains("terminal")
+        );
+    }
+    #[test]
+    fn new_descendant_of_reparented_approved_worker_blocks_shutdown() {
+        let original = vec![
+            fixture_process(10, 1, "claude"),
+            fixture_process(11, 10, "worker"),
+        ];
+        let snapshot = vec![
+            fixture_process(11, 1, "worker"),
+            fixture_process(12, 11, "generic"),
+        ];
+        assert!(remaining_targets(&original, &snapshot, &[]).is_err());
+    }
+    #[test]
+    fn shutdown_recheck_rejects_new_targets_and_reused_pids() {
+        let original = vec![fixture_process(10, 1, "claude")];
+        assert!(remaining_targets(&original, &original, &original).is_ok());
+        let mut reused = original.clone();
+        reused[0].started = "new birth".into();
+        assert!(remaining_targets(&original, &reused, &reused).is_err());
+        let fresh = vec![fixture_process(20, 1, "claude")];
+        assert!(remaining_targets(&original, &fresh, &fresh).is_err());
+        assert!(remaining_targets(&original, &[], &[]).unwrap().is_empty());
+    }
     #[test]
     fn metadata_change_and_symlinks_are_detected() {
         let root = tempfile::tempdir().unwrap();

@@ -282,69 +282,74 @@ fn choose(label: &str, options: &[Account], current: &str) -> Result<Account> {
 }
 
 fn prepare(data_root: &std::path::Path, cli_root: &std::path::Path) -> Result<()> {
+    let activity = runtime::inspect(data_root, cli_root)?;
+    let plan = runtime::shutdown_plan(&activity)?;
     prepare_observed(
-        runtime::inspect(data_root, cli_root)?,
+        activity,
+        &plan.pids(),
+        io::stdin().is_terminal(),
         &mut io::stdin().lock(),
         &mut io::stdout().lock(),
-        |pids| runtime::close_idle_desktop(pids, data_root, cli_root),
+        |_| runtime::close_confirmed(&plan, data_root, cli_root),
     )
 }
 
 fn prepare_observed(
     activity: Activity,
+    pids: &[i32],
+    interactive: bool,
     input: &mut dyn io::BufRead,
     output: &mut dyn Write,
     close: impl FnOnce(&[i32]) -> Result<()>,
 ) -> Result<()> {
-    match activity {
-        Activity::Stopped => Ok(()),
-        Activity::Busy { reasons } => {
-            for reason in reasons {
-                writeln!(output, "  {reason}")?;
-            }
-            bail!("作業中です。作業を終了してから進めてください。")
-        }
-        Activity::Unknown { reasons } => {
-            for reason in reasons {
-                writeln!(output, "  {reason}")?;
-            }
-            bail!(
-                "作業中か安全に判定できません。Claude Desktop・CLIと関連作業を終了してから進めてください。"
-            )
-        }
-        Activity::IdleDesktop { pids } => {
-            writeln!(
-                output,
-                "Claude Desktopが起動しています。観測中に作業の兆候はありませんでしたが、無活動を完全に保証するものではありません。"
-            )?;
-            write!(
-                output,
-                "アプリを終了して引き継ぎを進めますか？ [Yes/No]（既定: No）: "
-            )?;
-            output.flush()?;
-            let mut reply = String::new();
-            input.read_line(&mut reply)?;
-            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
-                bail!("終了を許可しなかったため、履歴は変更していません。");
-            }
-            close(&pids)
+    if activity == Activity::Stopped {
+        return Ok(());
+    }
+    if let Activity::Busy { reasons } | Activity::Unknown { reasons } = activity {
+        for reason in reasons {
+            writeln!(output, "  {reason}")?;
         }
     }
+    if pids.is_empty() {
+        bail!("Claudeの終了対象を安全に識別できません。手動で終了してから再実行してください。");
+    }
+    writeln!(
+        output,
+        "終了対象のClaude Desktop・CLI・ヘルパーと全子プロセス: PID {pids:?}"
+    )?;
+    if !interactive {
+        bail!("非対話実行ではClaudeを終了しません。ターミナルから再実行してください。");
+    }
+    writeln!(
+        output,
+        "作業中の処理や未保存の状態を失う可能性があります。正常終了を要求し、5秒後の残存対象は強制終了します。"
+    )?;
+    write!(
+        output,
+        "対象のClaudeプロセスをすべて終了して続行しますか？ [Yes/No]（既定: No）: "
+    )?;
+    output.flush()?;
+    let mut reply = String::new();
+    input.read_line(&mut reply)?;
+    if !matches!(reply.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
+        bail!("終了を許可しなかったため、プロセスと履歴は変更していません。");
+    }
+    close(pids)
 }
 
 fn show_activity(activity: &Activity) {
     match activity {
         Activity::Stopped => println!("Claude Desktop・CLI: 終了済み"),
         Activity::IdleDesktop { .. } => println!(
-            "Claude Desktop: 起動中 / 観測中の作業兆候なし。引き継ぎ時に終了のYes/Noを確認します。"
+            "Claude Desktop: 起動中 / 観測中の作業兆候なし。引き継ぎ時に全対象の終了を確認します。"
         ),
         Activity::Busy { reasons } | Activity::Unknown { reasons } => {
             println!(
                 "{}",
                 if matches!(activity, Activity::Busy { .. }) {
-                    "作業中です。作業を終了してから進めてください。"
+                    "Claude関連プロセスまたは履歴更新を検知しました。引き継ぎ時に識別できた全対象の終了を確認します。"
                 } else {
-                    "作業中か判定できません。引き継ぎを中止します。"
+                    "作業中か判定できません。終了対象を識別できない場合は引き継ぎを中止します。"
                 }
             );
             for reason in reasons {
@@ -391,6 +396,8 @@ mod tests {
         let mut output = Vec::new();
         prepare_observed(
             Activity::Stopped,
+            &[],
+            false,
             &mut Cursor::new(b""),
             &mut output,
             |_| panic!("must not close"),
@@ -400,59 +407,79 @@ mod tests {
     }
 
     #[test]
-    fn busy_and_unknown_never_close_even_with_yes() {
+    fn blockers_require_tty_and_explicit_yes() {
         for activity in [
             Activity::Busy {
                 reasons: vec!["CLI".into()],
             },
-            Activity::Unknown {
-                reasons: vec!["TCP".into()],
-            },
-        ] {
-            assert!(
-                prepare_observed(
-                    activity,
-                    &mut Cursor::new(b"Yes\n"),
-                    &mut Vec::new(),
-                    |_| panic!("must not close")
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn idle_requires_explicit_yes_and_rechecks_via_closer() {
-        for reply in ["No\n", "\n", "", "anything\n"] {
-            assert!(
-                prepare_observed(
-                    Activity::IdleDesktop { pids: vec![42] },
-                    &mut Cursor::new(reply),
-                    &mut Vec::new(),
-                    |_| panic!("must not close")
-                )
-                .is_err()
-            );
-        }
-        let closed = Cell::new(false);
-        prepare_observed(
             Activity::IdleDesktop { pids: vec![42] },
-            &mut Cursor::new("Yes\n"),
-            &mut Vec::new(),
-            |pids| {
-                assert_eq!(pids, &[42]);
-                closed.set(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(closed.get());
-        assert!(
+        ] {
+            for reply in ["No\n", "\n", "", "anything\n"] {
+                assert!(
+                    prepare_observed(
+                        activity.clone(),
+                        &[42],
+                        true,
+                        &mut Cursor::new(reply),
+                        &mut Vec::new(),
+                        |_| panic!("must not close")
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                prepare_observed(
+                    activity.clone(),
+                    &[42],
+                    false,
+                    &mut Cursor::new("Yes\n"),
+                    &mut Vec::new(),
+                    |_| panic!("non TTY must not close")
+                )
+                .is_err()
+            );
+            let closed = Cell::new(false);
             prepare_observed(
-                Activity::IdleDesktop { pids: vec![42] },
+                activity,
+                &[42],
+                true,
                 &mut Cursor::new("Yes\n"),
                 &mut Vec::new(),
-                |_| bail!("activity changed")
+                |pids| {
+                    assert_eq!(pids, &[42]);
+                    closed.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(closed.get());
+        }
+    }
+    #[test]
+    fn unidentified_activity_and_failed_recheck_do_not_proceed() {
+        assert!(
+            prepare_observed(
+                Activity::Unknown {
+                    reasons: vec!["failed observation".into()]
+                },
+                &[],
+                true,
+                &mut Cursor::new("Yes\n"),
+                &mut Vec::new(),
+                |_| panic!("must not close")
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_observed(
+                Activity::Busy {
+                    reasons: vec!["CLI".into()]
+                },
+                &[42],
+                true,
+                &mut Cursor::new("Yes\n"),
+                &mut Vec::new(),
+                |_| bail!("identity changed")
             )
             .is_err()
         );
