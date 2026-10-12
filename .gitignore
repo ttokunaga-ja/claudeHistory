@@ -1,2 +1,27 @@
 /target/
 .DS_Store
+
+# OS and editor temporary files
+Thumbs.db
+desktop.ini
+.AppleDouble/
+._*
+~$*
+*.swp
+*.swo
+
+# Local environment and credential files; keep templates
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+gha-creds-*.json
+application_default_credentials.json
+.netrc
+.git-credentials
+
+# Local agent state; shared commands and settings stay tracked
+/.claude/settings.local.json
+/.claude/worktrees/
+/.claude/.cc-writes/
