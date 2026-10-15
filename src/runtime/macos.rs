@@ -228,7 +228,7 @@ fn native_argv(_pid: i32) -> Result<Vec<String>> {
     bail!("unsupported platform");
 }
 #[cfg(target_os = "macos")]
-fn process_started(pid: i32) -> Result<String> {
+fn live_process_started(pid: i32) -> Result<Option<String>> {
     #[repr(C)]
     #[derive(Default)]
     struct BsdInfo {
@@ -250,16 +250,32 @@ fn process_started(pid: i32) -> Result<String> {
     }
     let mut info = BsdInfo::default();
     let size = std::mem::size_of::<BsdInfo>() as i32;
-    if unsafe { proc_pidinfo(pid, 3, 0, (&mut info as *mut BsdInfo).cast(), size) } != size {
+    let read = unsafe { proc_pidinfo(pid, 3, 0, (&mut info as *mut BsdInfo).cast(), size) };
+    if read != size {
+        let error = std::io::Error::last_os_error();
+        if read == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error).context("Process creation time observation unavailable");
+    }
+    // proc_bsdinfo.pbi_status: SZOMB is positive proof the process cannot run.
+    if info.fields[1] == 5 {
+        return Ok(None);
+    }
+    if info.start_seconds == 0 && info.start_microseconds == 0 {
         bail!("Process creation time observation unavailable");
     }
-    Ok(format!(
+    Ok(Some(format!(
         "{}:{}",
         info.start_seconds, info.start_microseconds
-    ))
+    )))
+}
+#[cfg(all(target_os = "macos", test))]
+fn process_started(pid: i32) -> Result<String> {
+    live_process_started(pid)?.context("Process has exited")
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn process_started(_pid: i32) -> Result<String> {
+fn live_process_started(_pid: i32) -> Result<Option<String>> {
     bail!("unsupported platform")
 }
 #[cfg(not(target_os = "windows"))]
@@ -272,21 +288,50 @@ pub(super) fn snapshot() -> Result<Vec<Process>> {
     if !out.status.success() {
         bail!("process observation failed");
     }
-    let mut processes = parse_native_snapshot(std::str::from_utf8(&out.stdout)?)?;
-    for p in &mut processes {
-        // Unrelated short-lived/system processes may disappear or be inaccessible.
-        // Every selected target must have a readable birth identity (checked by the core).
-        p.started = process_started(p.pid).unwrap_or_default();
+    enrich_processes(parse_native_snapshot(std::str::from_utf8(&out.stdout)?)?)
+}
+#[cfg(not(target_os = "windows"))]
+fn enrich_processes(processes: Vec<Process>) -> Result<Vec<Process>> {
+    let mut live = Vec::new();
+    for mut p in processes {
+        // Only positive exit evidence may remove an enumerated process. Permission
+        // failures remain unreadable identities and block any selected target.
+        p.started = match live_process_started(p.pid) {
+            Ok(Some(started)) => started,
+            Ok(None) => continue,
+            Err(_) => String::new(),
+        };
         let name = Path::new(&p.executable)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
         if name == "node" || name == "nodejs" {
-            p.args = native_argv(p.pid)?;
+            match native_argv(p.pid) {
+                Ok(args) => p.args = args,
+                Err(error) => {
+                    if matches!(live_process_started(p.pid), Ok(None)) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
         }
+        match live_process_started(p.pid) {
+            Ok(None) => continue,
+            Ok(Some(started)) if !p.started.is_empty() && p.started != started => {
+                bail!(
+                    "Process identity changed during observation (PID {}, birth)",
+                    p.pid
+                );
+            }
+            Err(_) => p.started.clear(),
+            Ok(Some(_)) => {}
+        }
+        live.push(p);
     }
-    Ok(processes)
+    Ok(live)
 }
+
 #[cfg(not(target_os = "windows"))]
 pub(super) fn tcp(pids: &[i32]) -> Result<bool> {
     let ids = pids
@@ -341,8 +386,11 @@ pub(super) fn terminate(process: &Process, force: bool) -> Result<()> {
     let pid = process.pid;
     #[cfg(target_os = "macos")]
     {
-        if process.started.is_empty() || process_started(pid)? != process.started {
-            bail!("Termination target creation time changed");
+        let Some(started) = live_process_started(pid)? else {
+            return Ok(());
+        };
+        if process.started.is_empty() || started != process.started {
+            bail!("Termination target creation time changed (PID {pid}, birth)");
         }
         if unsafe { libc::kill(pid, if force { libc::SIGKILL } else { libc::SIGTERM }) } != 0 {
             let error = std::io::Error::last_os_error();
@@ -507,6 +555,160 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_exiting_after_enumeration_is_not_a_changed_identity() {
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,stat=,comm="])
+            .output()
+            .unwrap();
+        let enumerated =
+            parse_native_snapshot(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+        assert_eq!(enumerated.len(), 1);
+        let mut approved = enumerated[0].clone();
+        approved.started = process_started(pid).unwrap();
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            if String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .starts_with('Z')
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture zombie timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let zombie_excluded = enrich_processes(enumerated.clone()).unwrap().is_empty();
+        let zombie_termination = terminate(&approved, false);
+        child.wait().unwrap();
+        assert!(zombie_excluded);
+        zombie_termination.unwrap();
+        assert!(enrich_processes(enumerated).unwrap().is_empty());
+        terminate(&approved, false).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_confirmed_tree_shutdown_handles_exits_and_escalation() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        struct Tree {
+            root: std::process::Child,
+            approved: Vec<Process>,
+        }
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                for process in &self.approved {
+                    let _ = terminate(process, true);
+                }
+                let _ = self.root.kill();
+                let _ = self.root.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let script = r#"trap 'exit 0' TERM
+/bin/sh -c 'trap "" TERM; printf ready > "$1"; while [ "$SECONDS" -lt 10 ]; do :; done' fixture "$1/force" &
+force=$!
+/bin/sleep 10 &
+normal=$!
+/bin/sh -c 'while [ ! -e "$1" ] && [ "$SECONDS" -lt 10 ]; do :; done' fixture "$1/exit" &
+spontaneous=$!
+printf '%s %s %s %s' "$$" "$force" "$normal" "$spontaneous" > "$1/pids"
+wait"#;
+        let mut tree = Tree {
+            root: Command::new("/bin/sh")
+                .args(["-c", script, "fixture"])
+                .arg(directory.path())
+                .spawn()
+                .unwrap(),
+            approved: Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !directory.path().join("force").is_file() || !directory.path().join("pids").is_file()
+        {
+            assert!(Instant::now() < deadline, "tree readiness timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pids: Vec<i32> = std::fs::read_to_string(directory.path().join("pids"))
+            .unwrap()
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 4);
+        let ids = pids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let observe = || {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &ids, "-o", "pid=,ppid=,stat=,comm="])
+                .output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    || (output.status.code() == Some(1) && output.stdout.is_empty()),
+                "fixture ps failed"
+            );
+            enrich_processes(parse_native_snapshot(std::str::from_utf8(&output.stdout)?)?)
+        };
+        tree.approved = observe().unwrap();
+        assert_eq!(tree.approved.len(), 4);
+        let first = Cell::new(true);
+        let signals = RefCell::new(Vec::new());
+        super::super::stop_with(
+            || {
+                if first.replace(false) {
+                    std::fs::write(directory.path().join("exit"), "exit")?;
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while live_process_started(pids[3])?.is_some() {
+                        anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "fixture spontaneous exit timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                let mut snapshot = observe()?;
+                snapshot.push(Process {
+                    pid: -99,
+                    ppid: 0,
+                    executable: "test harness".into(),
+                    args: Vec::new(),
+                    started: "harness".into(),
+                });
+                super::super::recheck_with(
+                    &tree.approved,
+                    &snapshot,
+                    -99,
+                    |p| p.pid == pids[0],
+                    |_| false,
+                )
+            },
+            |process, force| {
+                signals.borrow_mut().push((process.pid, force));
+                terminate(process, force)
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let signals = signals.borrow();
+        assert!(signals.contains(&(pids[0], false)));
+        assert!(signals.contains(&(pids[1], false)));
+        assert!(signals.contains(&(pids[1], true)));
+        assert!(signals.contains(&(pids[2], false)));
+        assert!(!signals.iter().any(|(pid, _)| *pid == pids[3]));
+        assert!(observe().unwrap().is_empty());
     }
     #[cfg(target_os = "macos")]
     #[test]

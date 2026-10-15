@@ -452,12 +452,20 @@ fn remaining_targets(
         .iter()
         .filter(|p| original.iter().any(|o| o.pid == p.pid))
     {
-        if !original.iter().any(|o| {
-            o.pid == current.pid
-                && o.executable == current.executable
-                && o.started == current.started
-        }) {
-            bail!("Claude process identity changed; no further termination requests sent");
+        let approved = original.iter().find(|o| o.pid == current.pid).unwrap();
+        let mut changed = Vec::new();
+        if approved.executable != current.executable {
+            changed.push("executable");
+        }
+        if approved.started != current.started {
+            changed.push("birth");
+        }
+        if !changed.is_empty() {
+            bail!(
+                "Claude process identity changed (PID {}, {}); no further termination requests sent",
+                current.pid,
+                changed.join(", ")
+            );
         }
     }
     let mut related: BTreeSet<_> = targets
@@ -825,7 +833,18 @@ mod tests {
         assert!(remaining_targets(&original, &original, &original).is_ok());
         let mut reused = original.clone();
         reused[0].started = "new birth".into();
-        assert!(remaining_targets(&original, &reused, &reused).is_err());
+        let message = remaining_targets(&original, &reused, &reused)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("PID 10, birth"));
+        assert!(!message.contains("new birth"));
+        let mut executed = original.clone();
+        executed[0].executable = "/private/changed-executable".into();
+        let message = remaining_targets(&original, &executed, &executed)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("PID 10, executable"));
+        assert!(!message.contains("/private/"));
         let fresh = vec![fixture_process(20, 1, "claude")];
         assert!(remaining_targets(&original, &fresh, &fresh).is_err());
         assert!(remaining_targets(&original, &[], &[]).unwrap().is_empty());
