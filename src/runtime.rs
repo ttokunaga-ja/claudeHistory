@@ -484,30 +484,18 @@ fn recheck_with(
     // Retain only the exact confirmed identities, even after their parents exit.
     // Validate them before granting ownership to any reparented survivor.
     let survivors = remaining_targets(original, snapshot)?;
-    let attributed = targets_with(snapshot, self_pid, |p| {
-        survivors.iter().any(|s| s.pid == p.pid)
-    })?;
     let targets = target_processes_with(
         snapshot,
         self_pid,
         |p| known(p) || survivors.iter().any(|approved| approved.pid == p.pid),
         uncertain_cli,
     )?;
-    if let Some(unowned) = targets
-        .iter()
-        .find(|p| !attributed.iter().any(|a| a.pid == p.pid))
-    {
-        bail!(
-            "New independent Claude process (PID {}); no further termination requests sent",
-            unowned.pid
-        );
-    }
-    for current in &attributed {
+    for current in &targets {
         if !original.iter().any(|p| p.pid == current.pid) {
             original.push(current.clone());
         }
     }
-    Ok(attributed)
+    Ok(targets)
 }
 fn recheck(approved: &mut Vec<Process>) -> Result<Vec<Process>> {
     recheck_with(
@@ -667,7 +655,7 @@ mod tests {
         }
     }
     #[test]
-    fn recheck_rejects_identity_changes_new_roots_descendants_and_caller_ancestry() {
+    fn recheck_rejects_identity_changes_unknown_roots_missing_identity_and_caller_ancestry() {
         let initial = target_fixture();
         let original = initial
             .iter()
@@ -679,7 +667,11 @@ mod tests {
             match change {
                 0 => snapshot[2].started = "replacement birth".into(),
                 1 => snapshot[2].executable = "/bin/replacement".into(),
-                2 => snapshot.push(fixture_process(20, 1, "desktop")),
+                2 => {
+                    let mut root = fixture_process(20, 1, "desktop");
+                    root.started.clear();
+                    snapshot.push(root);
+                }
                 3 => {
                     let mut p = fixture_process(20, 11, "/bin/new-worker");
                     p.started.clear();
@@ -696,6 +688,28 @@ mod tests {
                 })
                 .is_err(),
                 "change {change}"
+            );
+        }
+    }
+    #[test]
+    fn newly_started_known_roots_are_adopted_even_after_original_roots_exit() {
+        for parent in [1, 50] {
+            let mut ledger = vec![fixture_process(10, 1, "desktop")];
+            let snapshot = vec![
+                fixture_process(1, 0, "init"),
+                fixture_process(99, 1, "claudeHistory"),
+                fixture_process(20, parent, "desktop"),
+                fixture_process(21, 20, "worker"),
+            ];
+            let targets =
+                recheck_with(&mut ledger, &snapshot, 99, fixture_known, |_| false).unwrap();
+            assert_eq!(
+                targets.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                vec![20, 21]
+            );
+            assert_eq!(
+                ledger.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                vec![10, 20, 21]
             );
         }
     }
@@ -727,7 +741,7 @@ mod tests {
             let mut snapshot = vec![
                 fixture_process(1, 0, "init"),
                 fixture_process(99, 1, "claudeHistory"),
-                fixture_process(11, 10, "desktop"),
+                fixture_process(11, 10, "/tmp/Claude-unowned"),
             ];
             if reused {
                 let mut replacement = approved[0].clone();

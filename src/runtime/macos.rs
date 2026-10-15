@@ -829,6 +829,87 @@ wait "$child""#;
     }
     #[cfg(target_os = "macos")]
     #[test]
+    fn native_shutdown_adopts_an_independently_restarted_known_root() {
+        use std::cell::RefCell;
+        use std::time::{Duration, Instant};
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut first = Fixture(Command::new("/bin/sleep").arg("10").spawn().unwrap());
+        let first_pid = first.0.id() as i32;
+        let observe_pid = |pid: i32| -> Result<Vec<Process>> {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,stat=,comm="])
+                .output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    || (output.status.code() == Some(1) && output.stdout.is_empty()),
+                "fixture ps failed"
+            );
+            enrich_processes(parse_native_snapshot(std::str::from_utf8(&output.stdout)?)?)
+        };
+        let mut ledger = observe_pid(first_pid).unwrap();
+        assert_eq!(ledger.len(), 1);
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let second = Fixture(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; printf ready > \"$1\"; while [ \"$SECONDS\" -lt 8 ]; do :; done",
+                    "fixture",
+                ])
+                .arg(&ready)
+                .spawn()
+                .unwrap(),
+        );
+        let second_pid = second.0.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.is_file() {
+            assert!(Instant::now() < deadline, "fixture readiness timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let signals = RefCell::new(Vec::new());
+        super::super::stop_with(
+            || {
+                let mut snapshot = observe_pid(second_pid)?;
+                snapshot.push(Process {
+                    pid: -99,
+                    ppid: 0,
+                    executable: "test harness".into(),
+                    args: Vec::new(),
+                    started: "harness".into(),
+                });
+                super::super::recheck_with(
+                    &mut ledger,
+                    &snapshot,
+                    -99,
+                    |p| p.pid == first_pid || p.pid == second_pid,
+                    |_| false,
+                )
+            },
+            |process, force| {
+                signals.borrow_mut().push((process.pid, force));
+                terminate(process, force)
+            },
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(
+            *signals.borrow(),
+            vec![(second_pid, false), (second_pid, true)]
+        );
+        assert!(ledger.iter().any(|p| p.pid == second_pid));
+        assert!(observe_pid(second_pid).unwrap().is_empty());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_creation_identity_is_stable_and_nonempty() {
         let pid = std::process::id() as i32;
         let first = process_started(pid).unwrap();
