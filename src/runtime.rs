@@ -409,7 +409,10 @@ fn target_processes_with(
         bail!("Uncertain Claude CLI ownership; close it manually and retry");
     }
     if targets.iter().any(|p| p.started.is_empty()) {
-        bail!("Claude process creation identity unavailable");
+        bail!(
+            "Claude process creation identity unavailable (PID {})",
+            targets.iter().find(|p| p.started.is_empty()).unwrap().pid
+        );
     }
     Ok(targets)
 }
@@ -443,11 +446,7 @@ pub fn shutdown_plan(activity: &Activity) -> Result<ShutdownPlan> {
     }
     Ok(ShutdownPlan { processes })
 }
-fn remaining_targets(
-    original: &[Process],
-    snapshot: &[Process],
-    targets: &[Process],
-) -> Result<Vec<Process>> {
+fn remaining_targets(original: &[Process], snapshot: &[Process]) -> Result<Vec<Process>> {
     for current in snapshot
         .iter()
         .filter(|p| original.iter().any(|o| o.pid == p.pid))
@@ -468,33 +467,6 @@ fn remaining_targets(
             );
         }
     }
-    let mut related: BTreeSet<_> = targets
-        .iter()
-        .map(|p| p.pid)
-        .chain(
-            snapshot
-                .iter()
-                .filter(|p| original.iter().any(|o| o.pid == p.pid))
-                .map(|p| p.pid),
-        )
-        .collect();
-    loop {
-        let before = related.len();
-        for p in snapshot {
-            if related.contains(&p.ppid) {
-                related.insert(p.pid);
-            }
-        }
-        if related.len() == before {
-            break;
-        }
-    }
-    if related
-        .iter()
-        .any(|pid| !original.iter().any(|o| o.pid == *pid))
-    {
-        bail!("New Claude process appeared; no further termination requests sent");
-    }
     // Include confirmed descendants even when their parents have exited and they are reparented.
     Ok(snapshot
         .iter()
@@ -503,7 +475,7 @@ fn remaining_targets(
         .collect())
 }
 fn recheck_with(
-    original: &[Process],
+    original: &mut Vec<Process>,
     snapshot: &[Process],
     self_pid: i32,
     known: impl Fn(&Process) -> bool,
@@ -511,18 +483,35 @@ fn recheck_with(
 ) -> Result<Vec<Process>> {
     // Retain only the exact confirmed identities, even after their parents exit.
     // Validate them before granting ownership to any reparented survivor.
-    let survivors = remaining_targets(original, snapshot, &[])?;
+    let survivors = remaining_targets(original, snapshot)?;
+    let attributed = targets_with(snapshot, self_pid, |p| {
+        survivors.iter().any(|s| s.pid == p.pid)
+    })?;
     let targets = target_processes_with(
         snapshot,
         self_pid,
         |p| known(p) || survivors.iter().any(|approved| approved.pid == p.pid),
         uncertain_cli,
     )?;
-    remaining_targets(original, snapshot, &targets)
+    if let Some(unowned) = targets
+        .iter()
+        .find(|p| !attributed.iter().any(|a| a.pid == p.pid))
+    {
+        bail!(
+            "New independent Claude process (PID {}); no further termination requests sent",
+            unowned.pid
+        );
+    }
+    for current in &attributed {
+        if !original.iter().any(|p| p.pid == current.pid) {
+            original.push(current.clone());
+        }
+    }
+    Ok(attributed)
 }
-fn recheck(plan: &ShutdownPlan) -> Result<Vec<Process>> {
+fn recheck(approved: &mut Vec<Process>) -> Result<Vec<Process>> {
     recheck_with(
-        &plan.processes,
+        approved,
         &platform::snapshot()?,
         std::process::id() as i32,
         platform::known_current,
@@ -535,31 +524,61 @@ fn stop_with(
     grace: Duration,
 ) -> Result<()> {
     for force in [false, true] {
-        let remaining = observe()?;
-        for process in remaining.iter().rev() {
-            let current = observe()?;
-            if current.iter().any(|p| p.pid == process.pid) {
-                terminate(process, force)?;
-            }
-        }
         let deadline = Instant::now() + grace;
+        let mut signalled = BTreeSet::new();
         loop {
-            if observe()?.is_empty() {
+            let remaining = observe()?;
+            if remaining.is_empty() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 break;
             }
-            thread::sleep(Duration::from_millis(200));
+            // Stop parents before children so live supervisors cannot respawn helpers.
+            if remaining.iter().any(|p| !signalled.contains(&p.pid)) {
+                // Discovery, identity validation, and ordering use the fresh observation.
+                let current = observe()?;
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let next = current.iter().find(|p| {
+                    !signalled.contains(&p.pid)
+                        && !current
+                            .iter()
+                            .any(|parent| parent.pid == p.ppid && !signalled.contains(&parent.pid))
+                });
+                if let Some(process) = next {
+                    terminate(process, force)?;
+                    signalled.insert(process.pid);
+                }
+            } else {
+                thread::sleep(
+                    Duration::from_millis(200)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
         }
     }
-    bail!("Confirmed Claude processes did not exit; no history changed")
+    let remaining = observe()?;
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Confirmed Claude processes did not exit (PID {}); no history changed",
+        remaining
+            .iter()
+            .map(|p| p.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
+
 pub fn close_confirmed(plan: &ShutdownPlan, data_root: &Path, cli_root: &Path) -> Result<()> {
     supported()?;
-    // Never add targets after confirmation. Recheck before each request, including force.
+    // Confirmation covers these trees and descendants observed from verified survivors.
+    let mut approved = plan.processes.clone();
     stop_with(
-        || recheck(plan),
+        || recheck(&mut approved),
         platform::terminate,
         Duration::from_secs(5),
     )?;
@@ -618,7 +637,10 @@ mod tests {
             .filter(|p| p.pid != 10)
             .collect::<Vec<_>>();
         snapshot.iter_mut().find(|p| p.pid == 11).unwrap().ppid = 1;
-        let remaining = recheck_with(&original, &snapshot, 99, fixture_known, |_| false).unwrap();
+        let remaining = recheck_with(&mut original.clone(), &snapshot, 99, fixture_known, |_| {
+            false
+        })
+        .unwrap();
         assert_eq!(
             remaining.iter().map(|p| p.pid).collect::<Vec<_>>(),
             vec![11]
@@ -658,18 +680,142 @@ mod tests {
                 0 => snapshot[2].started = "replacement birth".into(),
                 1 => snapshot[2].executable = "/bin/replacement".into(),
                 2 => snapshot.push(fixture_process(20, 1, "desktop")),
-                3 => snapshot.push(fixture_process(20, 11, "/bin/new-worker")),
+                3 => {
+                    let mut p = fixture_process(20, 11, "/bin/new-worker");
+                    p.started.clear();
+                    snapshot.push(p);
+                }
                 4 => snapshot.push(fixture_process(20, 1, "/tmp/Claude-unowned")),
                 5 => snapshot.last_mut().unwrap().ppid = 11,
                 6 => snapshot[2].started.clear(),
                 _ => unreachable!(),
             }
             assert!(
-                recheck_with(&original, &snapshot, 99, fixture_known, |_| false).is_err(),
+                recheck_with(&mut original.clone(), &snapshot, 99, fixture_known, |_| {
+                    false
+                })
+                .is_err(),
                 "change {change}"
             );
         }
     }
+    #[test]
+    fn newly_attributed_descendants_are_adopted_and_survive_reparenting() {
+        let mut ledger = vec![fixture_process(10, 1, "desktop")];
+        let mut snapshot = vec![
+            fixture_process(1, 0, "init"),
+            fixture_process(99, 1, "claudeHistory"),
+            ledger[0].clone(),
+            fixture_process(11, 10, "new worker"),
+            fixture_process(12, 11, "nested worker"),
+        ];
+        let targets = recheck_with(&mut ledger, &snapshot, 99, fixture_known, |_| false).unwrap();
+        assert_eq!(
+            targets.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(ledger.len(), 3);
+        snapshot.retain(|p| p.pid != 10 && p.pid != 11);
+        snapshot.iter_mut().find(|p| p.pid == 12).unwrap().ppid = 1;
+        let targets = recheck_with(&mut ledger, &snapshot, 99, fixture_known, |_| false).unwrap();
+        assert_eq!(targets.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![12]);
+    }
+    #[test]
+    fn exited_and_reused_parent_ids_never_grant_new_ownership() {
+        let approved = vec![fixture_process(10, 1, "desktop")];
+        for reused in [false, true] {
+            let mut snapshot = vec![
+                fixture_process(1, 0, "init"),
+                fixture_process(99, 1, "claudeHistory"),
+                fixture_process(11, 10, "desktop"),
+            ];
+            if reused {
+                let mut replacement = approved[0].clone();
+                replacement.started = "reused birth".into();
+                snapshot.push(replacement);
+            }
+            let message = recheck_with(&mut approved.clone(), &snapshot, 99, fixture_known, |_| {
+                false
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(message.contains(if reused { "PID 10" } else { "PID 11" }));
+        }
+    }
+    #[test]
+    fn shutdown_signals_new_descendants_during_the_same_phase() {
+        use std::cell::RefCell;
+        let alive = RefCell::new(vec![fixture_process(10, 1, "desktop")]);
+        let signals = RefCell::new(Vec::new());
+        stop_with(
+            || Ok(alive.borrow().clone()),
+            |p, force| {
+                signals.borrow_mut().push((p.pid, force));
+                if p.pid == 10 && !force {
+                    alive
+                        .borrow_mut()
+                        .push(fixture_process(11, 10, "new worker"));
+                }
+                if force {
+                    alive.borrow_mut().retain(|p2| p2.pid != p.pid);
+                }
+                Ok(())
+            },
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(
+            *signals.borrow(),
+            vec![(10, false), (11, false), (10, true), (11, true)]
+        );
+    }
+    #[test]
+    fn fresh_pre_signal_snapshot_controls_parent_order() {
+        use std::cell::{Cell, RefCell};
+        let calls = Cell::new(0);
+        let alive = RefCell::new(vec![fixture_process(10, 1, "child")]);
+        let signals = RefCell::new(Vec::new());
+        stop_with(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    alive.borrow_mut()[0].ppid = 11;
+                    alive.borrow_mut().push(fixture_process(11, 1, "parent"));
+                }
+                Ok(alive.borrow().clone())
+            },
+            |p, _| {
+                signals.borrow_mut().push(p.pid);
+                alive.borrow_mut().retain(|a| a.pid != p.pid);
+                Ok(())
+            },
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(*signals.borrow(), vec![11, 10]);
+    }
+    #[test]
+    fn continuously_appearing_descendants_cannot_extend_phase_deadlines() {
+        use std::cell::RefCell;
+        let alive = RefCell::new(vec![fixture_process(10, 1, "root")]);
+        let began = Instant::now();
+        let result = stop_with(
+            || Ok(alive.borrow().clone()),
+            |p, _| {
+                let pid = 10 + alive.borrow().len() as i32;
+                alive
+                    .borrow_mut()
+                    .push(fixture_process(pid, p.pid, "new worker"));
+                thread::sleep(Duration::from_millis(2));
+                Ok(())
+            },
+            Duration::from_millis(40),
+        );
+        assert!(result.is_err());
+        assert!(alive.borrow().len() > 1);
+        assert!(began.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn graceful_then_force_covers_all_confirmed_survivors() {
         use std::cell::RefCell;
@@ -687,12 +833,12 @@ mod tests {
                 }
                 Ok(())
             },
-            Duration::ZERO,
+            Duration::from_millis(50),
         )
         .unwrap();
         assert_eq!(
             *signals.borrow(),
-            vec![(11, false), (10, false), (11, true), (10, true)]
+            vec![(10, false), (11, false), (10, true), (11, true)]
         );
     }
     #[test]
@@ -715,7 +861,7 @@ mod tests {
                 signals.set(signals.get() + 1);
                 Ok(())
             },
-            Duration::ZERO,
+            Duration::from_millis(50),
         );
         assert!(result.is_err());
         assert_eq!(signals.get(), 1);
@@ -737,14 +883,14 @@ mod tests {
                 alive.set(false);
                 Ok(())
             },
-            Duration::ZERO,
+            Duration::from_millis(50),
         )
         .unwrap();
         assert!(
             stop_with(
                 || Ok(vec![fixture_process(10, 1, "cli")]),
                 |_, _| Ok(()),
-                Duration::ZERO
+                Duration::from_millis(50)
             )
             .is_err()
         );
@@ -816,7 +962,7 @@ mod tests {
         );
     }
     #[test]
-    fn new_descendant_of_reparented_approved_worker_blocks_shutdown() {
+    fn new_descendant_of_reparented_approved_worker_is_adopted() {
         let original = vec![
             fixture_process(10, 1, "claude"),
             fixture_process(11, 10, "worker"),
@@ -825,29 +971,35 @@ mod tests {
             fixture_process(11, 1, "worker"),
             fixture_process(12, 11, "generic"),
         ];
-        assert!(remaining_targets(&original, &snapshot, &[]).is_err());
+        let mut snapshot = snapshot;
+        snapshot.push(fixture_process(99, 0, "claudeHistory"));
+        let targets =
+            recheck_with(&mut original.clone(), &snapshot, 99, |_| false, |_| false).unwrap();
+        assert_eq!(
+            targets.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![11, 12]
+        );
     }
     #[test]
     fn shutdown_recheck_rejects_new_targets_and_reused_pids() {
         let original = vec![fixture_process(10, 1, "claude")];
-        assert!(remaining_targets(&original, &original, &original).is_ok());
+        assert!(remaining_targets(&original, &original).is_ok());
         let mut reused = original.clone();
         reused[0].started = "new birth".into();
-        let message = remaining_targets(&original, &reused, &reused)
+        let message = remaining_targets(&original, &reused)
             .unwrap_err()
             .to_string();
         assert!(message.contains("PID 10, birth"));
         assert!(!message.contains("new birth"));
         let mut executed = original.clone();
         executed[0].executable = "/private/changed-executable".into();
-        let message = remaining_targets(&original, &executed, &executed)
+        let message = remaining_targets(&original, &executed)
             .unwrap_err()
             .to_string();
         assert!(message.contains("PID 10, executable"));
         assert!(!message.contains("/private/"));
-        let fresh = vec![fixture_process(20, 1, "claude")];
-        assert!(remaining_targets(&original, &fresh, &fresh).is_err());
-        assert!(remaining_targets(&original, &[], &[]).unwrap().is_empty());
+
+        assert!(remaining_targets(&original, &[]).unwrap().is_empty());
     }
     #[test]
     fn metadata_change_and_symlinks_are_detected() {

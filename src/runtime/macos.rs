@@ -688,7 +688,7 @@ wait"#;
                     started: "harness".into(),
                 });
                 super::super::recheck_with(
-                    &tree.approved,
+                    &mut tree.approved,
                     &snapshot,
                     -99,
                     |p| p.pid == pids[0],
@@ -706,8 +706,125 @@ wait"#;
         assert!(signals.contains(&(pids[0], false)));
         assert!(signals.contains(&(pids[1], false)));
         assert!(signals.contains(&(pids[1], true)));
-        assert!(signals.contains(&(pids[2], false)));
         assert!(!signals.iter().any(|(pid, _)| *pid == pids[3]));
+        assert!(observe().unwrap().is_empty());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_shutdown_tracks_a_respawned_child() {
+        use std::cell::RefCell;
+        use std::time::{Duration, Instant};
+        struct Tree {
+            root: std::process::Child,
+            approved: Vec<Process>,
+        }
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                for process in &self.approved {
+                    let _ = terminate(process, true);
+                }
+                let _ = self.root.kill();
+                let _ = self.root.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let script = r#"trap ':' TERM
+/bin/sh -c 'trap "exit 0" TERM; printf ready > "$1/first"; while [ "$SECONDS" -lt 8 ]; do :; done' fixture "$1" &
+child=$!
+printf '%s\n%s\n' "$$" "$child" > "$1/pids"
+while kill -0 "$child" 2>/dev/null; do wait "$child"; done
+/bin/sh -c 'trap "" TERM; printf ready > "$1/respawn"; while [ "$SECONDS" -lt 8 ]; do :; done' fixture "$1" &
+child=$!
+printf '%s\n' "$child" >> "$1/pids"
+wait "$child""#;
+        let mut tree = Tree {
+            root: Command::new("/bin/sh")
+                .args(["-c", script, "fixture"])
+                .arg(directory.path())
+                .spawn()
+                .unwrap(),
+            approved: Vec::new(),
+        };
+        let ready = |name: &str| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !directory.path().join(name).is_file() {
+                anyhow::ensure!(Instant::now() < deadline, "fixture readiness timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        };
+        ready("first").unwrap();
+        ready("pids").unwrap();
+        let observe = || -> Result<Vec<Process>> {
+            let ids = std::fs::read_to_string(directory.path().join("pids"))?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",");
+            let output = Command::new("/bin/ps")
+                .args(["-p", &ids, "-o", "pid=,ppid=,stat=,comm="])
+                .output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    || (output.status.code() == Some(1) && output.stdout.is_empty()),
+                "fixture ps failed"
+            );
+            enrich_processes(parse_native_snapshot(std::str::from_utf8(&output.stdout)?)?)
+        };
+        tree.approved = observe().unwrap();
+        assert_eq!(tree.approved.len(), 2);
+        let root_pid = tree.root.id() as i32;
+        let child_pid = tree
+            .approved
+            .iter()
+            .find(|p| p.pid != root_pid)
+            .unwrap()
+            .pid;
+        let signals = RefCell::new(Vec::new());
+        super::super::stop_with(
+            || {
+                let mut snapshot = observe()?;
+                snapshot.push(Process {
+                    pid: -99,
+                    ppid: 0,
+                    executable: "test harness".into(),
+                    args: Vec::new(),
+                    started: "harness".into(),
+                });
+                super::super::recheck_with(
+                    &mut tree.approved,
+                    &snapshot,
+                    -99,
+                    |p| p.pid == root_pid,
+                    |_| false,
+                )
+            },
+            |process, force| {
+                signals.borrow_mut().push((process.pid, force));
+                terminate(process, force)?;
+                if process.pid == child_pid && !force {
+                    ready("respawn")?;
+                }
+                Ok(())
+            },
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let signals = signals.borrow();
+        assert_eq!(signals[0], (root_pid, false));
+        assert!(signals.contains(&(child_pid, false)));
+        let adopted = tree
+            .approved
+            .iter()
+            .find(|p| p.pid != root_pid && p.pid != child_pid)
+            .unwrap();
+        assert!(signals.contains(&(adopted.pid, false)));
+        assert!(signals.contains(&(adopted.pid, true)));
+        let force_root = signals.iter().position(|s| *s == (root_pid, true)).unwrap();
+        let force_child = signals
+            .iter()
+            .position(|s| *s == (adopted.pid, true))
+            .unwrap();
+        assert!(force_root < force_child);
         assert!(observe().unwrap().is_empty());
     }
     #[cfg(target_os = "macos")]
