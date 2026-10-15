@@ -373,39 +373,59 @@ fn targets_with(
         .cloned()
         .collect())
 }
-fn target_processes(processes: &[Process]) -> Result<Vec<Process>> {
-    if processes.iter().any(|p| {
-        let name = p
-            .executable
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        name != "claudehistory"
-            && name != "claudehistory.exe"
-            && p.executable.to_ascii_lowercase().contains("claude")
-            && !platform::known_current(p)
-    }) {
-        bail!("Unrecognized Claude process; close it manually and retry");
+fn target_processes_with(
+    processes: &[Process],
+    self_pid: i32,
+    known: impl Fn(&Process) -> bool,
+    uncertain_cli: impl Fn(&Process) -> bool,
+) -> Result<Vec<Process>> {
+    let targets = targets_with(processes, self_pid, known)?;
+    let unknown: Vec<_> = processes
+        .iter()
+        .filter(|p| {
+            let name = p
+                .executable
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            name != "claudehistory"
+                && name != "claudehistory.exe"
+                && p.executable.to_ascii_lowercase().contains("claude")
+                && !targets.iter().any(|target| target.pid == p.pid)
+        })
+        .map(|p| p.pid.to_string())
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "Unrecognized Claude process (PID {}); close it manually and retry",
+            unknown.join(", ")
+        );
     }
-    if processes.iter().any(|p| {
-        !platform::known_current(p)
-            && matches!(
-                platform::classify_current(std::slice::from_ref(p), std::process::id() as i32),
-                Activity::Busy { .. }
-            )
-    }) {
+    if processes
+        .iter()
+        .any(|p| !targets.iter().any(|target| target.pid == p.pid) && uncertain_cli(p))
+    {
         bail!("Uncertain Claude CLI ownership; close it manually and retry");
     }
-    let targets = targets_with(
-        processes,
-        std::process::id() as i32,
-        platform::known_current,
-    )?;
     if targets.iter().any(|p| p.started.is_empty()) {
         bail!("Claude process creation identity unavailable");
     }
     Ok(targets)
+}
+fn uncertain_cli(p: &Process) -> bool {
+    matches!(
+        platform::classify_current(std::slice::from_ref(p), std::process::id() as i32),
+        Activity::Busy { .. }
+    )
+}
+fn target_processes(processes: &[Process]) -> Result<Vec<Process>> {
+    target_processes_with(
+        processes,
+        std::process::id() as i32,
+        platform::known_current,
+        uncertain_cli,
+    )
 }
 pub fn shutdown_plan(activity: &Activity) -> Result<ShutdownPlan> {
     supported()?;
@@ -474,10 +494,32 @@ fn remaining_targets(
         .cloned()
         .collect())
 }
+fn recheck_with(
+    original: &[Process],
+    snapshot: &[Process],
+    self_pid: i32,
+    known: impl Fn(&Process) -> bool,
+    uncertain_cli: impl Fn(&Process) -> bool,
+) -> Result<Vec<Process>> {
+    // Retain only the exact confirmed identities, even after their parents exit.
+    // Validate them before granting ownership to any reparented survivor.
+    let survivors = remaining_targets(original, snapshot, &[])?;
+    let targets = target_processes_with(
+        snapshot,
+        self_pid,
+        |p| known(p) || survivors.iter().any(|approved| approved.pid == p.pid),
+        uncertain_cli,
+    )?;
+    remaining_targets(original, snapshot, &targets)
+}
 fn recheck(plan: &ShutdownPlan) -> Result<Vec<Process>> {
-    let snapshot = platform::snapshot()?;
-    let targets = target_processes(&snapshot)?;
-    remaining_targets(&plan.processes, &snapshot, &targets)
+    recheck_with(
+        &plan.processes,
+        &platform::snapshot()?,
+        std::process::id() as i32,
+        platform::known_current,
+        uncertain_cli,
+    )
 }
 fn stop_with(
     mut observe: impl FnMut() -> Result<Vec<Process>>,
@@ -529,6 +571,95 @@ mod tests {
             executable: executable.into(),
             args: vec![],
             started: "birth".into(),
+        }
+    }
+    fn target_fixture() -> Vec<Process> {
+        vec![
+            fixture_process(1, 0, "init"),
+            fixture_process(10, 1, "desktop"),
+            fixture_process(
+                11,
+                10,
+                "/Users/me/Library/Application Support/Claude/Claude Extensions/ext/.venv/bin/python",
+            ),
+            fixture_process(99, 1, "claudeHistory"),
+        ]
+    }
+    fn fixture_known(p: &Process) -> bool {
+        p.executable == "desktop"
+    }
+    #[test]
+    fn target_selection_accepts_attributed_claude_path_descendants() {
+        let targets =
+            target_processes_with(&target_fixture(), 99, fixture_known, |_| false).unwrap();
+        assert_eq!(
+            targets.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+    }
+    #[test]
+    fn recheck_preserves_approved_claude_path_worker_after_parent_exits() {
+        let initial = target_fixture();
+        let original = initial
+            .iter()
+            .filter(|p| p.pid == 10 || p.pid == 11)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut snapshot = initial
+            .into_iter()
+            .filter(|p| p.pid != 10)
+            .collect::<Vec<_>>();
+        snapshot.iter_mut().find(|p| p.pid == 11).unwrap().ppid = 1;
+        let remaining = recheck_with(&original, &snapshot, 99, fixture_known, |_| false).unwrap();
+        assert_eq!(
+            remaining.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![11]
+        );
+    }
+    #[test]
+    fn target_selection_rejects_unowned_paths_and_uncertain_cli_roots() {
+        for path in [
+            "/tmp/Claude-worker",
+            "/tmp/Claude.app/Contents/Helpers/disclaimer-fake",
+            "/usr/bin/node",
+        ] {
+            let mut snapshot = target_fixture();
+            snapshot.push(fixture_process(20, 1, path));
+            let message = target_processes_with(&snapshot, 99, fixture_known, |p| {
+                p.executable == "/usr/bin/node"
+            })
+            .unwrap_err()
+            .to_string();
+            if path.contains("Claude") {
+                assert!(message.contains("PID 20"));
+            }
+            assert!(!message.contains(path));
+        }
+    }
+    #[test]
+    fn recheck_rejects_identity_changes_new_roots_descendants_and_caller_ancestry() {
+        let initial = target_fixture();
+        let original = initial
+            .iter()
+            .filter(|p| p.pid == 10 || p.pid == 11)
+            .cloned()
+            .collect::<Vec<_>>();
+        for change in 0..7 {
+            let mut snapshot = initial.clone();
+            match change {
+                0 => snapshot[2].started = "replacement birth".into(),
+                1 => snapshot[2].executable = "/bin/replacement".into(),
+                2 => snapshot.push(fixture_process(20, 1, "desktop")),
+                3 => snapshot.push(fixture_process(20, 11, "/bin/new-worker")),
+                4 => snapshot.push(fixture_process(20, 1, "/tmp/Claude-unowned")),
+                5 => snapshot.last_mut().unwrap().ppid = 11,
+                6 => snapshot[2].started.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                recheck_with(&original, &snapshot, 99, fixture_known, |_| false).is_err(),
+                "change {change}"
+            );
         }
     }
     #[test]

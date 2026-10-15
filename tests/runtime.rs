@@ -103,3 +103,24 @@ fn native_argv_preserves_spaces_and_separate_option_values() {
         Activity::Busy { .. }
     ));
 }
+
+#[test]
+fn bundled_disclaimer_is_idle_with_desktop_and_its_extensions_are_busy() {
+    let app = "10 1 /Applications/Claude.app/Contents/MacOS/Claude\n11 10 /Applications/Claude.app/Contents/Helpers/disclaimer\n";
+    assert_eq!(
+        classify_fixture(app, &[], 999).unwrap(),
+        Activity::IdleDesktop { pids: vec![10, 11] }
+    );
+    assert!(matches!(classify_fixture(&format!("{app}12 11 /Users/me/Library/Application Support/Claude/Claude Extensions/ext/.venv/bin/python\n"), &[], 999).unwrap(), Activity::Busy { .. }));
+    assert_eq!(
+        classify_fixture(
+            "11 1 /Applications/Claude.app/Contents/Helpers/disclaimer\n",
+            &[],
+            999
+        )
+        .unwrap(),
+        Activity::Unknown {
+            reasons: vec!["Desktop helpers exist without the main app".into()]
+        }
+    );
+}

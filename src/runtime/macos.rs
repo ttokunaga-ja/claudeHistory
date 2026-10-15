@@ -36,6 +36,7 @@ fn desktop(p: &Process) -> bool {
         return false;
     };
     tail == "MacOS/Claude"
+        || tail == "Helpers/disclaimer"
         || (tail.starts_with("Frameworks/")
             && (matches!(
                 Path::new(tail).file_name().and_then(|s| s.to_str()),
@@ -373,6 +374,26 @@ pub(super) fn redirected(metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn bundled_disclaimer_is_recognized_without_its_parent() {
+        let p = parse("10 1 /Applications/Claude.app/Contents/Helpers/disclaimer")
+            .unwrap()
+            .remove(0);
+        assert!(desktop(&p));
+        assert_eq!(
+            classify_with(&[p], 99, desktop, main_desktop_current, cli),
+            Activity::Unknown {
+                reasons: vec!["Desktop helpers exist without the main app".into()]
+            }
+        );
+        for path in [
+            "/Applications/Claude.app/Contents/Helpers/disclaimer-fake",
+            "/Applications/Claude.app/Contents/Helpers/nested/disclaimer",
+            "/tmp/Claude Extensions/disclaimer",
+        ] {
+            assert!(!desktop(&parse(&format!("10 1 {path}")).unwrap().remove(0)));
+        }
+    }
+    #[test]
     fn native_cli_ownership_accepts_only_exact_version_leaf() {
         for (path, owned) in [
             ("/Users/me/.local/share/claude/versions/2.1.296", true),
@@ -427,6 +448,65 @@ mod tests {
         })();
         child.wait().unwrap();
         observed.unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_termination_checks_birth_and_escalates_disposable_child() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Child, Stdio};
+        struct Fixture(Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready_path = directory.path().join("ready");
+        let mut child = Fixture(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; printf ready > \"$1\"; while :; do read line; done",
+                    "fixture",
+                ])
+                .arg(&ready_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready_path.is_file() {
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture readiness timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid = child.0.id() as i32;
+        let mut process = parse(&format!("{pid} 1 /bin/sh")).unwrap().remove(0);
+        process.started = "wrong birth".into();
+        assert!(terminate(&process, false).is_err());
+        assert!(child.0.try_wait().unwrap().is_none());
+        process.started = process_started(pid).unwrap();
+        terminate(&process, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(child.0.try_wait().unwrap().is_none());
+        terminate(&process, true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture exit timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     #[cfg(target_os = "macos")]
     #[test]
