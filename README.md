@@ -29,6 +29,8 @@ claudeHistory --version
 claudeHistory --help
 ```
 
+`--version`で`claudeHistory 0.5.2`と表示されれば今回の修正版です。旧版からは`claudeHistory update`で更新できます。403エラーで更新できない旧版は、上のインストールコマンドを再実行してください。
+
 チェックサムや実行ファイルの検証に失敗した場合は、既存の実行ファイルを置き換えません。更新時も同じインストールコマンドを使います。配布パッケージを手動で取得する場合は[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)からダウンロードし、展開したフォルダー内の`install.sh`または`install.ps1`を実行してください。展開コマンドはダウンロード先のフォルダーで実行する必要があります。
 
 ## 使い方
@@ -43,7 +45,7 @@ claudeHistory
 
 ```text
 1: すべてのアカウントに不足履歴を同期
-2: 現在のアカウントへ片方向で引き継ぎ
+2: 現在のアカウントへ引き継ぎ
 3: 状態確認
 ```
 

@@ -20,8 +20,8 @@ function Assert-NoReparsePoint([string]$Path) {
 
 function Assert-Version([string]$Path) {
     $version = @(& $Path --version)
-    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.5.1') {
-        throw 'Expected claudeHistory 0.5.1; the installed executable has not been changed.'
+    if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1 -or $version[0] -cne 'claudeHistory 0.5.2') {
+        throw 'Expected claudeHistory 0.5.2; the installed executable has not been changed.'
     }
 }
 
