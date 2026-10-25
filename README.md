@@ -29,7 +29,7 @@ claudeHistory --version
 claudeHistory --help
 ```
 
-このソース版は`claudeHistory 0.5.4`です。`waiting-input`対応とChrome連携プロセスの誤検出修正はローカル修正版として検証しており、公開リリース・自動更新への反映はまだ行っていません。公開済みの版へは`claudeHistory update`で更新できます。403エラーで更新できない旧版は、上のインストールコマンドを再実行してください。
+`--version`で`claudeHistory 0.5.4`と表示されれば、`waiting-input`対応とChrome連携プロセスの誤検出修正を含む版です。旧版からは`claudeHistory update`で更新できます。403エラーで更新できない旧版は、上のインストールコマンドを再実行してください。
 
 チェックサムや実行ファイルの検証に失敗した場合は、既存の実行ファイルを置き換えません。更新時も同じインストールコマンドを使います。配布パッケージを手動で取得する場合は[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)からダウンロードし、展開したフォルダー内の`install.sh`または`install.ps1`を実行してください。展開コマンドはダウンロード先のフォルダーで実行する必要があります。
 
