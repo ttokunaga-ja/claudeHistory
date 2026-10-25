@@ -10,5 +10,5 @@ mkdir -p "$task_dest"
 cp target/release/claudeHistory "$task_dest/claudeHistory"
 cp scripts/install.sh README.md LICENSE "$task_dest/"
 (cd "$task_dest" && shasum -a 256 claudeHistory > SHA256SUMS)
-tar -czf "$task_dest.tar.gz" -C "$(dirname "$task_dest")" "$(basename "$task_dest")"
+COPYFILE_DISABLE=1 tar -czf "$task_dest.tar.gz" -C "$(dirname "$task_dest")" "$(basename "$task_dest")"
 printf '%s\n' "$task_dest.tar.gz"
