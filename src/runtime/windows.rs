@@ -37,6 +37,7 @@ fn parse(snapshot: &str) -> Result<Vec<Process>> {
                 executable,
                 args,
                 started: row.started,
+                non_history_bridge: false,
             })
         })
         .collect()

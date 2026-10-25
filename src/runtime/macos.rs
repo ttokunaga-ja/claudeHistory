@@ -2,7 +2,7 @@ use super::{Activity, Process, classify_with};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 #[cfg(not(target_os = "windows"))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 pub(super) fn parse(snapshot: &str) -> Result<Vec<Process>> {
     snapshot
         .lines()
@@ -27,6 +27,7 @@ pub(super) fn parse(snapshot: &str) -> Result<Vec<Process>> {
                 executable: exe.trim().into(),
                 args: Vec::new(),
                 started: String::new(),
+                non_history_bridge: false,
             })
         })
         .collect()
@@ -329,7 +330,68 @@ fn enrich_processes(processes: Vec<Process>) -> Result<Vec<Process>> {
         }
         live.push(p);
     }
+    mark_non_history_bridges(&mut live, verify_bridge_signature_and_birth);
     Ok(live)
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+const CHROME_PATH: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+#[cfg(any(not(target_os = "windows"), test))]
+const BRIDGE_PATH: &str = "/Applications/Claude.app/Contents/Helpers/chrome-native-host";
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn mark_non_history_bridges(processes: &mut [Process], verify: impl Fn(&Process) -> bool) {
+    let parents: std::collections::BTreeMap<_, _> = processes
+        .iter()
+        .map(|p| (p.pid, p.executable.as_str()))
+        .collect();
+    let identified: Vec<_> = processes
+        .iter()
+        .map(|p| {
+            p.executable == BRIDGE_PATH
+                && !p.started.is_empty()
+                && parents.get(&p.ppid).copied() == Some(CHROME_PATH)
+                && verify(p)
+        })
+        .collect();
+    for (p, is_bridge) in processes.iter_mut().zip(identified) {
+        p.non_history_bridge = is_bridge;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn verify_bridge_signature_and_birth(process: &Process) -> bool {
+    if live_process_started(process.pid).ok().flatten().as_deref() != Some(process.started.as_str())
+    {
+        return false;
+    }
+    let requirement = r#"=anchor apple generic and identifier "chrome-native-host" and certificate leaf[subject.OU] = "Q6L2SF6YDW""#;
+    let Ok(mut child) = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "-R", requirement, BRIDGE_PATH])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let valid_signature = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    valid_signature
+        && live_process_started(process.pid).ok().flatten().as_deref()
+            == Some(process.started.as_str())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -421,6 +483,109 @@ pub(super) fn redirected(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verified_chrome_bridge_is_not_history_activity_or_shutdown_target() {
+        let mut processes = parse("10 0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n11 10 /Applications/Claude.app/Contents/Helpers/chrome-native-host\n12 0 /bin/zsh\n13 12 claudeHistory").unwrap();
+        for p in &mut processes {
+            p.started = "birth".into();
+        }
+        mark_non_history_bridges(&mut processes, |_| true);
+        assert!(processes[1].non_history_bridge);
+        assert_eq!(
+            classify_with(&processes, 13, desktop, main_desktop_current, cli),
+            Activity::Stopped
+        );
+        let targets = super::super::target_processes_with(
+            &processes,
+            13,
+            |p| desktop(p) || native_cli_owned(p),
+            |_| false,
+        )
+        .unwrap();
+        assert!(targets.is_empty());
+        let mut with_desktop = processes;
+        let mut desktop_process = parse("14 0 /Applications/Claude.app/Contents/MacOS/Claude")
+            .unwrap()
+            .remove(0);
+        desktop_process.started = "birth".into();
+        with_desktop.push(desktop_process);
+        assert_eq!(
+            classify_with(&with_desktop, 13, desktop, main_desktop_current, cli),
+            Activity::IdleDesktop { pids: vec![14] }
+        );
+        let targets = super::super::target_processes_with(
+            &with_desktop,
+            13,
+            |p| desktop(p) || native_cli_owned(p),
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(targets.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![14]);
+    }
+    #[test]
+    fn bridge_identification_requires_exact_path_chrome_parent_birth_and_signature() {
+        let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        let host = "/Applications/Claude.app/Contents/Helpers/chrome-native-host";
+        for (path, parent, birth, signed) in [
+            (host, chrome, "birth", false),
+            (
+                "/tmp/Claude.app/Contents/Helpers/chrome-native-host",
+                chrome,
+                "birth",
+                true,
+            ),
+            (host, "/bin/zsh", "birth", true),
+            (host, chrome, "", true),
+        ] {
+            let mut processes = parse(&format!("10 0 {parent}\n11 10 {path}")).unwrap();
+            processes[1].started = birth.into();
+            mark_non_history_bridges(&mut processes, |_| signed);
+            assert!(!processes[1].non_history_bridge);
+            assert!(matches!(
+                classify_with(&processes, 99, desktop, main_desktop_current, cli),
+                Activity::Unknown { .. }
+            ));
+        }
+    }
+    #[test]
+    fn verified_bridge_retains_ancestry_and_does_not_hide_cli_child() {
+        let mut processes = parse("10 0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n11 10 /Applications/Claude.app/Contents/Helpers/chrome-native-host\n12 11 /usr/local/bin/claude\n13 0 claudeHistory").unwrap();
+        for p in &mut processes {
+            p.started = "birth".into();
+        }
+        mark_non_history_bridges(&mut processes, |_| true);
+        assert!(matches!(
+            classify_with(&processes, 13, desktop, main_desktop_current, cli),
+            Activity::Busy { .. }
+        ));
+        let targets = super::super::target_processes_with(
+            &processes,
+            13,
+            |p| desktop(p) || native_cli_owned(p),
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(targets.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![12]);
+    }
+    #[test]
+    fn cli_ancestor_of_chrome_bridge_prevents_any_shutdown_target() {
+        let mut processes = parse("10 0 /usr/local/bin/claude\n11 10 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n12 11 /Applications/Claude.app/Contents/Helpers/chrome-native-host\n13 0 claudeHistory").unwrap();
+        for p in &mut processes {
+            p.started = "birth".into();
+        }
+        mark_non_history_bridges(&mut processes, |_| true);
+        assert!(processes[2].non_history_bridge);
+        let error = super::super::target_processes_with(
+            &processes,
+            13,
+            |p| desktop(p) || native_cli_owned(p),
+            |_| false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("bridge"));
+        assert!(!error.contains("/Applications/"));
+    }
     #[test]
     fn bundled_disclaimer_is_recognized_without_its_parent() {
         let p = parse("10 1 /Applications/Claude.app/Contents/Helpers/disclaimer")
@@ -686,6 +851,7 @@ wait"#;
                     executable: "test harness".into(),
                     args: Vec::new(),
                     started: "harness".into(),
+                    non_history_bridge: false,
                 });
                 super::super::recheck_with(
                     &mut tree.approved,
@@ -789,6 +955,7 @@ wait "$child""#;
                     executable: "test harness".into(),
                     args: Vec::new(),
                     started: "harness".into(),
+                    non_history_bridge: false,
                 });
                 super::super::recheck_with(
                     &mut tree.approved,
@@ -885,6 +1052,7 @@ wait "$child""#;
                     executable: "test harness".into(),
                     args: Vec::new(),
                     started: "harness".into(),
+                    non_history_bridge: false,
                 });
                 super::super::recheck_with(
                     &mut ledger,

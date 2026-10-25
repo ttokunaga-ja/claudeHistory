@@ -45,6 +45,7 @@ struct Process {
     executable: String,
     args: Vec<String>,
     started: String,
+    non_history_bridge: bool,
 }
 fn node_cli(p: &Process) -> bool {
     node_cli_with(p, true)
@@ -129,7 +130,8 @@ fn classify_with(
             busy.push(format!("Claude CLI is running (PID {})", p.pid));
         } else if related.contains(&p.pid) && !desktop(p) {
             busy.push(format!("Claude job descendant is running (PID {})", p.pid));
-        } else if !desktop(p)
+        } else if !p.non_history_bridge
+            && !desktop(p)
             && p.executable.rsplit(['/', '\\']).next().is_some_and(|s| {
                 !s.eq_ignore_ascii_case("claudehistory")
                     && !s.eq_ignore_ascii_case("claudehistory.exe")
@@ -380,6 +382,11 @@ fn target_processes_with(
     uncertain_cli: impl Fn(&Process) -> bool,
 ) -> Result<Vec<Process>> {
     let targets = targets_with(processes, self_pid, known)?;
+    if targets.iter().any(|p| p.non_history_bridge) {
+        bail!(
+            "Verified Chrome bridge is in a Claude process tree; close it manually and retry. No further termination requests sent."
+        );
+    }
     let unknown: Vec<_> = processes
         .iter()
         .filter(|p| {
@@ -391,6 +398,7 @@ fn target_processes_with(
                 .to_ascii_lowercase();
             name != "claudehistory"
                 && name != "claudehistory.exe"
+                && !p.non_history_bridge
                 && p.executable.to_ascii_lowercase().contains("claude")
                 && !targets.iter().any(|target| target.pid == p.pid)
         })
@@ -438,7 +446,10 @@ pub fn shutdown_plan(activity: &Activity) -> Result<ShutdownPlan> {
                 && r != "Desktop has TCP connections; activity cannot be distinguished"
         })
     {
-        bail!("Activity observation failed or changed; close Claude manually and retry");
+        bail!(
+            "Activity observation failed or changed: {}; close Claude manually and retry",
+            reasons.join("; ")
+        );
     }
     let processes = target_processes(&platform::snapshot()?)?;
     if *activity == Activity::Stopped && !processes.is_empty() {
@@ -586,6 +597,7 @@ mod tests {
             executable: executable.into(),
             args: vec![],
             started: "birth".into(),
+            non_history_bridge: false,
         }
     }
     fn target_fixture() -> Vec<Process> {

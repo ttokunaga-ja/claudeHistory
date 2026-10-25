@@ -52,7 +52,13 @@ fn update(
     let latest_parts = parse_version(latest).context("リリースタグの版が不正です")?;
     let current_parts = parse_version(current).context("現在の版が不正です")?;
     if latest_parts <= current_parts {
-        println!("最新です（v{current}）");
+        if latest_parts == current_parts {
+            println!("公開最新版です（v{current}）");
+        } else {
+            println!(
+                "公開最新版はv{latest}です。現在のv{current}はそれより新しいため、更新しません。"
+            );
+        }
         return Ok(false);
     }
     println!("v{current} → {tag} に更新します");
@@ -373,6 +379,28 @@ mod tests {
         assert!(mock_update(&exe, &bytes, &good_hash, "v0.2.0", true).unwrap());
         assert_eq!(fs::read(&exe).unwrap(), b"new executable");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn newer_local_version_does_not_download_assets_or_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("claudeHistory-test");
+        fs::write(&exe, b"newer local build").unwrap();
+        let mut requests = 0;
+        let changed = update(
+            &exe,
+            "0.5.4",
+            |url| {
+                requests += 1;
+                assert_eq!(url, format!("https://github.com/{REPO}/releases/latest"));
+                Ok(format!("https://github.com/{REPO}/releases/tag/v0.5.2").into_bytes())
+            },
+            |_, _| panic!("newer local build must not be replaced"),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(requests, 1);
+        assert_eq!(fs::read(exe).unwrap(), b"newer local build");
     }
 
     #[test]
