@@ -410,3 +410,123 @@ fn discovered_account_without_organization_fails_closed() {
     );
     assert!(!store.backup_root.exists());
 }
+
+#[test]
+fn waiting_input_is_preserved_and_excluded_from_discovery_sync_and_undo() {
+    let (_temp, store, accounts) = fixture();
+    let waiting = dir(&store, &accounts[0]).join("waiting-input");
+    fs::create_dir_all(waiting.join("blobs")).unwrap();
+    // Invalid JSON here is pending input, not a history registration.
+    let pending = waiting.join(name(0));
+    fs::write(&pending, b"pending input, not registration JSON").unwrap();
+    fs::write(waiting.join("blobs/input.bin"), [0, 255, 1]).unwrap();
+    let empty = dir(&store, &accounts[1]).join("waiting-input");
+    fs::create_dir(&empty).unwrap();
+    let discovered = store.accounts().unwrap();
+    assert_eq!(discovered.len(), 3);
+    assert!(discovered.iter().all(|a| a.sessions == 1));
+    let plan = store.plan_sync(&discovered).unwrap();
+    assert!(plan.targets.iter().all(|t| t.additions == 2));
+    // Pending-input changes are outside the registration snapshot.
+    fs::write(&pending, b"new pending input").unwrap();
+    let backup = store.apply_sync(&plan).unwrap();
+    assert_eq!(fs::read(&pending).unwrap(), b"new pending input");
+    assert_eq!(
+        fs::read(waiting.join("blobs/input.bin")).unwrap(),
+        [0, 255, 1]
+    );
+    assert!(empty.is_dir());
+    assert!(!dir(&store, &accounts[2]).join("waiting-input").exists());
+    assert!(
+        store
+            .plan_sync(&store.accounts().unwrap())
+            .unwrap()
+            .targets
+            .iter()
+            .all(|t| t.additions == 0)
+    );
+    assert_eq!(store.undo(&backup).unwrap(), 6);
+    assert_eq!(fs::read(&pending).unwrap(), b"new pending input");
+    assert!(empty.is_dir());
+    for a in store.accounts().unwrap() {
+        assert_eq!(a.sessions, 1);
+    }
+}
+
+#[test]
+fn waiting_input_does_not_relax_other_directory_or_registration_checks() {
+    for invalid in [
+        "directory",
+        "registration-directory",
+        "bad-filename",
+        "malformed",
+        "wrong-session",
+        "relative-cwd",
+    ] {
+        let (_temp, store, accounts) = fixture();
+        let root = dir(&store, &accounts[0]);
+        fs::create_dir(root.join("waiting-input")).unwrap();
+        match invalid {
+            "directory" => fs::create_dir(root.join("unexpected-directory")).unwrap(),
+            "registration-directory" => fs::create_dir(root.join(name(99))).unwrap(),
+            "bad-filename" => fs::write(root.join("local_invalid.json"), b"{}").unwrap(),
+            "malformed" => fs::write(root.join(name(0)), b"{").unwrap(),
+            "wrong-session" => fs::write(
+                root.join(name(0)),
+                serde_json::to_vec(&json!({"sessionId":"wrong", "cwd":store.root})).unwrap(),
+            )
+            .unwrap(),
+            "relative-cwd" => fs::write(
+                root.join(name(0)),
+                serde_json::to_vec(
+                    &json!({"sessionId":name(0).trim_end_matches(".json"), "cwd":"relative"}),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(store.accounts().is_err(), "discovery accepted {invalid}");
+        assert!(
+            store.plan_sync(&accounts).is_err(),
+            "sync accepted {invalid}"
+        );
+        assert!(!store.backup_root.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn waiting_input_symlink_is_still_rejected() {
+    let (temp, store, accounts) = fixture();
+    let target = temp.path().join("external-input");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, dir(&store, &accounts[0]).join("waiting-input")).unwrap();
+    assert!(store.accounts().is_err());
+    assert!(store.plan_sync(&accounts).is_err());
+    assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+    assert!(!store.backup_root.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn waiting_input_junction_is_still_rejected() {
+    let (temp, store, accounts) = fixture();
+    let target = temp.path().join("external-input");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep"), b"keep").unwrap();
+    let junction = dir(&store, &accounts[0]).join("waiting-input");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(store.accounts().is_err());
+    assert!(store.plan_sync(&accounts).is_err());
+    assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+    assert!(!store.backup_root.exists());
+    fs::remove_dir(junction).unwrap();
+}

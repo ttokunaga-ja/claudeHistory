@@ -1,4 +1,19 @@
-# v0.5.2の検証
+# 検証記録
+
+## v0.5.3：waiting-inputの同期対象除外
+
+2026-10-25にmacOS Apple SiliconとSSH接続したWindows 11 x64/MSVC実機で検証した。公開リリース・タグ作成は行っていない。
+
+- 先に回帰テストで`unexpected session directory entry`を再現し、修正後にmacOS 103件・Windows 101件のRustテストが成功。両OSでfmt、strict Clippy、release buildと版表示も成功した。
+- 空・内容ありの`waiting-input`を同期とundoの後も保持すること、別アカウントへコピーしないこと、内部の入力データが変化しても登録JSONのスナップショットへ含めないことを検証した。
+- 不正な登録ファイル名、JSON、sessionId、相対cwdと想定外のディレクトリーは引き続き拒否する。macOSのシンボリックリンクとWindows実機のジャンクションも、`waiting-input`という名前であっても拒否した。
+- macOS実データの`sync --dry-run`は終了コード0となり、7保存先の同期計画を表示した。実行前後で登録JSON 758件のSHA-256が一致し、`waiting-input`1件も変更されていない。実データの同期・削除・アプリ終了は行っていない。
+- 実データのプロセス確認では、`Claude.app/Contents/Helpers/chrome-native-host`（検証時PID 1196）が未識別となる別件警告が残る。この版では終了対象の識別ロジックを変更していないため、同期計画の正常化と実同期の完了は区別する。
+- macOSは同梱・自動取得インストーラーをモック配布元と一時フォルダーで検証し、Windowsは同梱インストーラーの正常インストール、既存版置換、不正チェックサム、重複manifest、不一致バージョンでの既存本体保持とパッケージ生成を検証した。実データを使うWindows検証は行っていない。
+
+生ログ・実機検証記録・旧版実行ファイルのバックアップはローカルの`target/validation/v0.5.3/`へ保管し、Gitには含めていない。
+
+## v0.5.2の検証
 
 2026-10-15にmacOS Apple Siliconと、SSH接続したWindows x64 MSVC実機で検証。実行コマンドは[READMEの開発・配布手順](README.md)を参照。
 

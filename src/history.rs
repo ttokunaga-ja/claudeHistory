@@ -151,10 +151,13 @@ fn snapshot(path: &Path) -> Result<Snapshot> {
         let entry = entry?;
         let p = entry.path();
         safe_path(&p)?;
-        ensure!(
-            entry.file_type()?.is_file(),
-            "unexpected session directory entry"
-        );
+        let kind = entry.file_type()?;
+        // Claude owns pending-input data; never inspect or synchronize it.
+        // safe_path above still rejects symlinks and Windows reparse points.
+        if entry.file_name() == "waiting-input" && kind.is_dir() {
+            continue;
+        }
+        ensure!(kind.is_file(), "unexpected session directory entry");
         let name = entry
             .file_name()
             .into_string()
