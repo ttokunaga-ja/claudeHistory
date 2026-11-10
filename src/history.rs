@@ -84,7 +84,7 @@ fn filename(s: &str) -> bool {
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn safe_path(path: &Path) -> Result<()> {
+pub(crate) fn safe_path(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "path must be absolute");
     let mut prefix = PathBuf::new();
     for component in path.components() {
@@ -101,7 +101,10 @@ fn safe_path(path: &Path) -> Result<()> {
         match fs::symlink_metadata(&prefix) {
             Ok(m) => platform::reject_redirect(&m, &prefix)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("パスを確認できません: {}", prefix.display()));
+            }
         }
     }
     Ok(())
@@ -137,8 +140,14 @@ fn journal(path: &Path, manifest: &Manifest) -> Result<()> {
 }
 fn read(path: &Path) -> Result<Vec<u8>> {
     safe_path(path)?;
-    ensure!(fs::symlink_metadata(path)?.is_file(), "not a regular file");
-    Ok(fs::read(path)?)
+    ensure!(
+        fs::symlink_metadata(path)
+            .with_context(|| format!("ファイルを確認できません: {}", path.display()))?
+            .is_file(),
+        "not a regular file: {}",
+        path.display()
+    );
+    fs::read(path).with_context(|| format!("ファイルを読み取れません: {}", path.display()))
 }
 fn snapshot(path: &Path) -> Result<Snapshot> {
     safe_path(path)?;
@@ -823,6 +832,17 @@ impl Store {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+    #[test]
+    fn missing_config_error_includes_the_attempted_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store {
+            root: temp.path().canonicalize().unwrap().join("missing-Claude"),
+            backup_root: temp.path().join("unused-backup"),
+        };
+        let error = format!("{:#}", store.current_account().unwrap_err());
+        assert!(error.contains(&store.root.join("config.json").display().to_string()));
+        assert!(!store.root.exists());
+    }
     #[test]
     fn pending_publication_is_rolled_back_if_directory_sync_fails() {
         let temp = tempfile::tempdir().unwrap();

@@ -24,7 +24,7 @@
 
 ## Windows
 
-Windows x64のネイティブ実行ファイルを配布する。既定のDesktop保存先は`%APPDATA%/Claude`。プロセス・親子関係・TCP接続をWindows上で観測し、取得失敗は判定不能として中止する。Desktopの正常終了要求はウィンドウへのWM_CLOSEとし、確認済みの残存対象だけをTerminateProcessで終了する。ジャンクション等のreparse pointも拒否し、バックアップのアクセス権と排他制御をWindows上で検証する。共通の履歴変更・復旧と状態判定はコアに集約し、OS依存の取得・終了・ファイル操作は専用モジュールに分離する。Windowsネイティブでテスト・release build・配布パッケージの起動・fixture引き継ぎとundoを確認してから公開する。
+Windows x64のネイティブ実行ファイルを配布する。Desktop保存先は`%APPDATA%/Claude`と`%LOCALAPPDATA%/Claude-Data/*`から、config.jsonとclaude-code-sessionsがある唯一の候補を検出する。複数候補・未検出なら確認先と--data-dirによる明示指定を案内して中止する。--data-dirの明示指定は自動検出より優先する。プロセス・親子関係・TCP接続をWindows上で観測し、取得失敗は判定不能として中止する。Desktopの正常終了要求はウィンドウへのWM_CLOSEとし、確認済みの残存対象だけをTerminateProcessで終了する。ジャンクション等のreparse pointも拒否し、バックアップのアクセス権と排他制御をWindows上で検証する。共通の履歴変更・復旧と状態判定はコアに集約し、OS依存の取得・終了・ファイル操作は専用モジュールに分離する。Windowsネイティブでテスト・release build・配布パッケージの起動・fixture引き継ぎとundoを確認してから公開する。
 
 ## 受入条件
 

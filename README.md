@@ -29,7 +29,7 @@ claudeHistory --version
 claudeHistory --help
 ```
 
-`--version`で`claudeHistory 0.5.4`と表示されれば、`waiting-input`対応とChrome連携プロセスの誤検出修正を含む版です。旧版からは`claudeHistory update`で更新できます。403エラーで更新できない旧版は、上のインストールコマンドを再実行してください。
+`--version`で`claudeHistory 0.5.5`と表示されれば、Windowsの新しい`Claude-Data`保存先の自動検出を含む版です。旧版からは`claudeHistory update`で更新できます。403エラーで更新できない旧版は、上のインストールコマンドを再実行してください。
 
 チェックサムや実行ファイルの検証に失敗した場合は、既存の実行ファイルを置き換えません。更新時も同じインストールコマンドを使います。配布パッケージを手動で取得する場合は[Releases](https://github.com/ttokunaga-ja/claudeHistory/releases/latest)からダウンロードし、展開したフォルダー内の`install.sh`または`install.ps1`を実行してください。展開コマンドはダウンロード先のフォルダーで実行する必要があります。
 
@@ -94,7 +94,7 @@ TCP接続や履歴更新はstatusで表示します。通信内容は読みま�
 
 ## 保存形式と検証の限界
 
-DesktopデータフォルダーはmacOSで`~/Library/Application Support/Claude`、Windowsで`%APPDATA%\Claude`です。対象はその配下の`claude-code-sessions/<account>/<org>/local_*.json`です。同じ階層の`waiting-input`ディレクトリーはClaude本体の入力待ちデータとして、削除・読み取り・コピーをせず同期対象から除外します。登録JSONのファイル名・形式・参照先の検証と、シンボリックリンク・Windowsのジャンクション等の拒否は維持します。その他の想定外のディレクトリーは引き続き中止します。保存先が異なる場合は`--data-dir`で明示します。移すのは登録情報で、同じPC上の会話本文への参照を維持します。本文そのものがなくなった会話を復旧する機能ではありません。Desktop内部形式に依存するため、アプリ更新後は`--dry-run`と画面で確認してください。件数だけで全会話が続行可能とは判断できません。
+DesktopデータフォルダーはmacOSで`~/Library/Application Support/Claude`、Windowsでは`%APPDATA%\Claude`と`%LOCALAPPDATA%\Claude-Data\*`から、`config.json`と`claude-code-sessions`を含む保存先を自動検出します。候補が複数ある場合は自動選択せず、`--data-dir`で使用するフォルダーを指定してください。対象はその配下の`claude-code-sessions/<account>/<org>/local_*.json`です。同じ階層の`waiting-input`ディレクトリーはClaude本体の入力待ちデータとして、削除・読み取り・コピーをせず同期対象から除外します。登録JSONのファイル名・形式・参照先の検証と、シンボリックリンク・Windowsのジャンクション等の拒否は維持します。その他の想定外のディレクトリーは引き続き中止します。保存先が異なる場合は`--data-dir`で明示します。移すのは登録情報で、同じPC上の会話本文への参照を維持します。本文そのものがなくなった会話を復旧する機能ではありません。Desktop内部形式に依存するため、アプリ更新後は`--dry-run`と画面で確認してください。件数だけで全会話が続行可能とは判断できません。
 
 現在のアカウント候補は`config.json`の`lastKnownAccountUuid`から取得します。これは認証状態の証明ではありません。移行先組織が未作成なら、このツールでIDを推測して作成せず、Desktopにログインし直して保存状態を確認してください。
 
